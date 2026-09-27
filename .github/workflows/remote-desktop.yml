@@ -78,7 +78,11 @@ jobs:
 
           foreach ($cert in $certificates) {
             $certFilePath = Join-Path -Path $certsFolder -ChildPath "$($cert.Thumbprint).cer"
-            $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert) | Set-Content -Path $certFilePath -Encoding Byte
+            # HINWEIS: "-Encoding Byte" gibt es unter PowerShell 7 (pwsh) nicht
+            # mehr (nur in Windows PowerShell 5.1). Der Ersatz dafuer ist
+            # "-AsByteStream". Ohne diese Anpassung bricht der Schritt mit
+            # "'Byte' is not a supported encoding name" ab.
+            $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert) | Set-Content -Path $certFilePath -AsByteStream
             Import-Certificate -FilePath $certFilePath -CertStoreLocation "Cert:\LocalMachine\TrustedPublisher" | Out-Null
           }
 
