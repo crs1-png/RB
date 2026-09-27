@@ -53,11 +53,18 @@ jobs:
 
       - name: Apply Modern Look (Yaru Theme + Chrome Dark Mode)
         run: |
-          # WARUM YARU: Das ist Ubuntus offizielles, modernes Standard-Theme
-          # (seit Ubuntu 20.04+). Es ist rein CSS/Icon-basiert - kein
-          # Compositing, keine 3D-Effekte, kein GPU-Bedarf. Dadurch bleibt
-          # das System genauso stabil und leicht wie reines XFCE vorher,
-          # sieht aber deutlich moderner/flacher aus (dunkles Design).
+          # WARUM YARU (fuer Inhalte): Das ist Ubuntus offizielles, modernes
+          # Standard-Theme (seit Ubuntu 20.04+) fuer App-Fensterinhalte und
+          # Icons. Es ist rein CSS/Icon-basiert - kein Compositing, keine
+          # 3D-Effekte, kein GPU-Bedarf.
+          #
+          # HINWEIS: Es gibt auf Ubuntu KEIN offizielles apt-Paket fuer ein
+          # Yaru-XFWM4-Fensterrahmen-Theme (das existiert nur als Arch-
+          # Linux-AUR-Paket bzw. muesste aufwendig aus dem Yaru-Quellcode
+          # kompiliert werden - unnoetig fragil). Stattdessen nutzen wir
+          # "arc-theme": eines der wenigen offiziellen Ubuntu-Pakete, das
+          # bereits ein fertiges, dunkles xfwm4-Fensterrahmen-Theme mitbringt
+          # (Arc-Dark) - das kombiniert sich optisch stimmig mit Yaru.
           #
           # WARUM NICHT xfconf-query: Das Setzen von Themes zur Laufzeit
           # braucht eine laufende D-Bus/XFCE-Session. Stattdessen schreiben
@@ -66,7 +73,7 @@ jobs:
           sudo apt-get install -y \
             yaru-theme-gtk \
             yaru-theme-icon \
-            yaru-theme-window-manager \
+            arc-theme \
             fonts-ubuntu \
             fonts-noto-color-emoji
 
@@ -88,12 +95,15 @@ jobs:
           </channel>
           EOF
 
-          # xfwm4: Fensterrahmen/Titelleisten-Theme ebenfalls auf Yaru-Dark.
+          # xfwm4: Fensterrahmen/Titelleisten-Theme auf Arc-Dark (siehe
+          # Begruendung oben - kein offizielles Yaru-xfwm4-Paket auf Ubuntu
+          # verfuegbar). Arc-Dark ist ebenfalls ein flaches, dunkles Design
+          # und passt optisch gut zu den Yaru-GTK-Fensterinhalten.
           cat > ~/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <channel name="xfwm4" version="1.0">
             <property name="general" type="empty">
-              <property name="theme" type="string" value="Yaru-dark"/>
+              <property name="theme" type="string" value="Arc-Dark"/>
               <property name="title_font" type="string" value="Ubuntu Bold 9"/>
               <property name="button_layout" type="string" value="O|HMC"/>
             </property>
