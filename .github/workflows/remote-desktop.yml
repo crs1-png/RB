@@ -1,4 +1,4 @@
-name: Remote Desktop Runner (Windows, Zero Trust, Auto-Restart + Google Drive)
+name: Remote Desktop Runner (Windows, Zero Trust, Auto-Restart)
 
 on:
   workflow_dispatch:
@@ -25,61 +25,21 @@ jobs:
     timeout-minutes: 350   # Hard-Limit von GitHub Actions liegt bei 360 Min.
 
     steps:
-      - name: Install Cloudflared & rclone
+      - name: Install Cloudflared
         shell: powershell
         run: |
-          # Cloudflared installieren (für den Zero-Trust-Tunnel/RDP)
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
 
-          # rclone installieren - wird NUR genutzt, um den kleinen
-          # Google-Drive-Anmeldeordner zwischen den Sessions zu übertragen,
-          # NICHT für deine eigentlichen Arbeitsdateien (die übernimmt
-          # Google Drive Desktop selbst, live und automatisch).
-          Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "C:\rclone.zip"
-          Expand-Archive -Path "C:\rclone.zip" -DestinationPath "C:\rclone" -Force
-          $rcloneDir = Get-ChildItem "C:\rclone" -Directory | Select-Object -First 1
-          Copy-Item "$($rcloneDir.FullName)\rclone.exe" "C:\Windows\System32\rclone.exe"
-
-      - name: Install Google Drive Desktop (silent)
+      - name: Install Chrome & Google Drive Desktop (silent)
         shell: powershell
         run: |
+          # Chrome über Chocolatey installieren (ist auf GitHub-Runnern vorinstalliert)
+          choco install googlechrome -y --no-progress
+
+          # Google Drive Desktop silent installieren
           Invoke-WebRequest -Uri "https://dl.google.com/drive-file-stream/GoogleDriveSetup.exe" -OutFile "C:\GoogleDriveSetup.exe"
           Start-Process -FilePath "C:\GoogleDriveSetup.exe" -ArgumentList "--silent","--desktop_shortcut" -Wait
-          echo "✅ Google Drive Desktop installiert."
-
-      - name: Restore Google-Drive-Anmeldedaten aus Cloud-Backup
-        shell: powershell
-        env:
-          RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
-        run: |
-          New-Item -ItemType Directory -Force -Path "C:\rclone-config" | Out-Null
-          [System.IO.File]::WriteAllBytes(
-            "C:\rclone-config\rclone.conf",
-            [System.Convert]::FromBase64String($env:RCLONE_CONF_B64)
-          )
-
-          $driveFsPath = "C:\Users\runneradmin\AppData\Local\Google\DriveFS"
-          New-Item -ItemType Directory -Force -Path $driveFsPath | Out-Null
-
-          # Passe "backupcloud:drivefs-backup" ggf. an deinen Remote-Namen an.
-          # Dieser Ordner enthält NUR die Anmelde-/Session-Daten von Google
-          # Drive Desktop, keine eigentlichen Arbeitsdateien.
-          rclone sync "backupcloud:drivefs-backup" $driveFsPath `
-            --config "C:\rclone-config\rclone.conf" `
-            --create-empty-src-dirs
-          echo "✅ Google-Drive-Session wiederhergestellt (falls vorhanden)."
-
-      - name: Start Google Drive Desktop
-        shell: powershell
-        run: |
-          $drivePath = "C:\Program Files\Google\Drive File Stream"
-          $exe = Get-ChildItem -Path $drivePath -Filter "GoogleDriveFS.exe" -Recurse | Select-Object -First 1
-          Start-Process -FilePath $exe.FullName
-          Start-Sleep -Seconds 15
-          echo "ℹ️  Falls dies die ALLERERSTE Session ist: Bitte gleich per RDP"
-          echo "   verbinden und dich EINMALIG manuell in Google Drive einloggen."
-          echo "   Ab der nächsten Session läuft es automatisch, ohne erneuten Login"
-          echo "   (siehe Setup-Anleitung, Hinweis zu Google-Sicherheitsprüfungen)."
+          echo "✅ Chrome & Google Drive Desktop installiert."
 
       - name: Enable Remote Desktop (RDP)
         shell: powershell
@@ -117,33 +77,19 @@ jobs:
           Start-Sleep -Seconds 5
 
           echo "=========================================="
-          echo "✅ Windows Remote Desktop läuft, erreichbar via Cloudflare Zero Trust."
+          echo "✅ Remote Desktop läuft, erreichbar via Cloudflare Zero Trust."
           echo "   Verbinden per: cloudflared access rdp --hostname DEIN-HOSTNAME --url rdp://localhost:3389"
-          echo "   Danach RDP-Client auf localhost:PORT (siehe Anleitung unten)."
-          echo "   Dein Arbeitsordner liegt live-synchronisiert unter G:\ (Google Drive)."
+          echo "   Danach RDP-Client auf localhost:PORT."
+          echo "   Melde dich in Google Drive / Chrome einfach selbst manuell an."
           echo "=========================================="
 
-      - name: Keep Alive mit periodischer Sicherung der Google-Drive-Session & Auto-Neustart
+      - name: Keep Alive mit Auto-Neustart
         shell: powershell
         run: |
-          $confPath    = "C:\rclone-config\rclone.conf"
-          $driveFsPath = "C:\Users\runneradmin\AppData\Local\Google\DriveFS"
-          $remote      = "backupcloud:drivefs-backup"
+          # Phase 1: Großteil der Laufzeit "normal" offen halten.
+          Start-Sleep -Seconds (325 * 60)
 
-          function Backup-DriveSession {
-            rclone sync $driveFsPath $remote --config $confPath --exclude "**/content_cache/**"
-            echo "💾 Google-Drive-Session gesichert: $(Get-Date -Format 'HH:mm:ss')"
-          }
-
-          # Phase 1: ~325 Minuten aktiv, alle 15 Minuten Session-Backup
-          # (Arbeitsdateien selbst brauchen KEIN manuelles Backup mehr -
-          # Google Drive Desktop synchronisiert sie live im Hintergrund.)
-          for ($i = 1; $i -le 21; $i++) {
-            Start-Sleep -Seconds 900
-            Backup-DriveSession
-          }
-
-          Backup-DriveSession
+          # Nächsten Lauf anstoßen, mit ausreichend Puffer vor dem Timeout.
           echo "Stoße nächsten Lauf an (Auto-Neustart)..."
           $headers = @{
             Authorization = "Bearer ${{ secrets.GITHUB_TOKEN }}"
@@ -154,5 +100,7 @@ jobs:
             -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/remote-desktop-windows.yml/dispatches" `
             -Headers $headers -Body $body
 
-          Start-Sleep -Seconds 300
+          # Restlichen Puffer offen halten, bis dieser Lauf sauber endet und
+          # der wartende Lauf übernehmen kann.
+          Start-Sleep -Seconds (10 * 60)
           echo "Dieser Lauf endet jetzt - der nachrückende Lauf übernimmt in Kürze."
