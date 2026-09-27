@@ -45,21 +45,30 @@ jobs:
           # Windows als ungueltig verworfen -> "WSA 10065 no route to host".
           #
           # Stattdessen muss die ECHTE interne IP-Adresse des Runners
-          # verwendet werden. Diese IP ist bei JEDEM Lauf neu (ephemere VM),
-          # daher wird sie hier klar sichtbar ausgegeben, damit du sie fuer
-          # die RDP-Direct-URL kopieren kannst:
-          # https://<app-domain>/rdp/<vnet-id>/<DIESE-IP>/3389
-          $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-                 Where-Object {
-                   $_.IPAddress -ne "127.0.0.1" -and
-                   $_.IPAddress -notlike "169.254.*" -and
-                   $_.PrefixOrigin -ne "WellKnown"
-                 } | Select-Object -First 1).IPAddress
+          # verwendet werden. Diese IP ist bei JEDEM Lauf neu (ephemere VM).
+          #
+          # ACHTUNG: Windows-Runner haben Docker/Hyper-V vorinstalliert,
+          # welches einen zusaetzlichen virtuellen "Default Switch"-Adapter
+          # mit einer 172.x-Adresse erzeugt. Ein einfacher "erste gefundene
+          # IP"-Filter greift oft versehentlich DIESEN Adapter ab, nicht die
+          # echte Netzwerkkarte, ueber die cloudflared/das Internet laeuft.
+          #
+          # Daher: gezielt die IP des Adapters ermitteln, der die
+          # Standard-Route (0.0.0.0/0, also den Internetzugang) besitzt -
+          # das ist garantiert die richtige, von aussen erreichbare Karte.
+          $defaultRoute = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
+                           Sort-Object -Property RouteMetric |
+                           Select-Object -First 1
+          $ip = (Get-NetIPAddress -InterfaceIndex $defaultRoute.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                 Select-Object -First 1).IPAddress
 
           echo "=========================================="
           echo "  INTERNE IP FUER DIESEN LAUF: $ip"
           echo "  (Diese IP fuer die RDP-URL statt 127.0.0.1 verwenden!)"
           echo "=========================================="
+          echo "--- Zur Kontrolle: alle IPv4-Adressen auf diesem Runner ---"
+          Get-NetIPAddress -AddressFamily IPv4 | Select-Object IPAddress, InterfaceAlias, PrefixOrigin | Format-Table -AutoSize
+          echo "-------------------------------------------------------------"
 
       - name: Install Virtual Display Driver (Fix fuer schwarzen/blauen RDP-Bildschirm)
         shell: pwsh
