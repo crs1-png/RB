@@ -1,0 +1,92 @@
+name: Remote Desktop Runner (Zero Trust)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: remote-desktop
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" /opt/hostedtoolcache /usr/local/lib/android || true
+          docker system prune -af --volumes || true
+
+      - name: Install Desktop Environment & Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xfce4 \
+            xfce4-terminal \
+            xvfb \
+            x11vnc \
+            novnc \
+            websockify \
+            curl \
+            wget
+
+          # Google Chrome installieren
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
+          rm google-chrome-stable_current_amd64.deb
+
+      - name: Install Cloudflared
+        run: |
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
+      - name: Start Display & Desktop Services
+        run: |
+          # Virtuelles Display (1080p) starten
+          Xvfb :99 -screen 0 1920x1080x24 &
+          export DISPLAY=:99
+          sleep 2
+
+          # XFCE Desktop-Umgebung starten
+          startxfce4 &
+          sleep 5
+
+          # VNC Server ohne Passwort starten (-nopw)
+          # -localhost bindet den VNC-Port NUR an localhost,
+          # damit er ausschließlich über den noVNC-Proxy erreichbar ist
+          x11vnc -nopw -localhost -rfbport 5900 -forever -shared -display :99 &
+          sleep 2
+
+          # noVNC Web-Proxy starten (Port 6080)
+          # websockify wird direkt genutzt (apt-Paket "novnc" bringt das
+          # utils/novnc_proxy-Skript nicht zuverlässig mit - websockify
+          # ist der offiziell von Debian/Ubuntu dokumentierte Weg)
+          websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
+          sleep 2
+
+      - name: Start Cloudflare Tunnel
+        env:
+          TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+        run: |
+          if [ -z "$TUNNEL_TOKEN" ]; then
+            echo "❌ FEHLER: Secret CLOUDFLARE_TUNNEL_TOKEN ist nicht gesetzt!"
+            exit 1
+          fi
+
+          # Cloudflare Tunnel mit deinem Token starten
+          nohup cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+          sleep 5
+
+          echo "=========================================="
+          echo "✅ Remote Desktop läuft und ist via Cloudflare Zero Trust erreichbar."
+          echo "   Rufe https://DEINE-SUBDOMAIN.DEINE-DOMAIN.com/vnc.html auf"
+          echo "=========================================="
+
+      - name: Keep Alive Loop
+        run: |
+          # Hält den Runner aktiv (etwas kürzer als das Job-Timeout,
+          # damit der Job sauber endet statt hart abgebrochen zu werden)
+          for i in {1..340}; do
+            sleep 60
+          done
