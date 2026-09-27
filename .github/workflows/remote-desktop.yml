@@ -36,6 +36,72 @@ jobs:
           choco install googlechrome -y --no-progress
           echo "Chrome installiert."
 
+      - name: Install Virtual Display Driver (Fix fuer schwarzen/blauen RDP-Bildschirm)
+        shell: pwsh
+        run: |
+          # PROBLEM: GitHub-Actions-Windows-Runner haben KEINEN physischen
+          # Grafikadapter. Browser-basiertes RDP (Cloudflare Access) verbindet
+          # sich zwar erfolgreich, zeigt aber nur einen leeren blauen/schwarzen
+          # Bildschirm, weil Windows kein Display zum Rendern hat.
+          #
+          # LOESUNG: "Virtual Display Driver" (IDD) installieren - simuliert
+          # einen echten Monitor, damit RDP etwas zum Anzeigen hat.
+          # Quelle (offizielles Community-Script, MIT-Lizenz, 10k+ Stars):
+          # https://github.com/VirtualDrivers/Virtual-Display-Driver/blob/master/Community%20Scripts/silent-install.ps1
+          $ErrorActionPreference = "Stop"
+
+          $NefConURL  = "https://github.com/nefarius/nefcon/releases/download/v1.14.0/nefcon_v1.14.0.zip"
+          $DriverURL  = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip"
+
+          $tempDir = Join-Path $env:TEMP "VDDInstall"
+          New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+
+          echo "Lade NefCon (Treiber-Installer) herunter..."
+          $NefConZipPath = Join-Path $tempDir "nefcon.zip"
+          Invoke-WebRequest -Uri $NefConURL -OutFile $NefConZipPath -UseBasicParsing
+          Expand-Archive -Path $NefConZipPath -DestinationPath $tempDir -Force
+          $NefConExe = Join-Path $tempDir "x64\nefconw.exe"
+
+          echo "Lade Virtual Display Driver herunter..."
+          $driverZipPath = Join-Path $tempDir "driver.zip"
+          Invoke-WebRequest -Uri $DriverURL -OutFile $driverZipPath
+          Expand-Archive -Path $driverZipPath -DestinationPath $tempDir -Force
+
+          echo "Importiere Treiber-Zertifikat (SignPath) als vertrauenswuerdig..."
+          $catFile = Join-Path $tempDir "VirtualDisplayDriver\mttvdd.cat"
+          $catBytes = [System.IO.File]::ReadAllBytes($catFile)
+          $certificates = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+          $certificates.Import($catBytes)
+
+          $certsFolder = Join-Path $tempDir "ExportedCerts"
+          New-Item -ItemType Directory -Path $certsFolder -Force | Out-Null
+
+          foreach ($cert in $certificates) {
+            $certFilePath = Join-Path -Path $certsFolder -ChildPath "$($cert.Thumbprint).cer"
+            $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert) | Set-Content -Path $certFilePath -Encoding Byte
+            Import-Certificate -FilePath $certFilePath -CertStoreLocation "Cert:\LocalMachine\TrustedPublisher" | Out-Null
+          }
+
+          echo "Installiere Virtual Display Driver..."
+          Push-Location $tempDir
+          & $NefConExe install ".\VirtualDisplayDriver\MttVDD.inf" "Root\MttVDD"
+          Start-Sleep -Seconds 10
+          Pop-Location
+
+          # Kurze Diagnose: pruefen, ob der virtuelle Monitor jetzt existiert.
+          $vdd = Get-PnpDevice -FriendlyName "*IddSampleDriver*" -ErrorAction SilentlyContinue
+          if ($null -eq $vdd) {
+            $vdd = Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -like "*IddSampleDriver*" -or $_.Name -like "*Virtual Display*" }
+          }
+          if ($vdd) {
+            echo "Virtual Display Driver erfolgreich installiert: $($vdd.Name)"
+          } else {
+            Write-Warning "Virtual Display Driver wurde installiert, aber im Geraetemanager noch nicht sichtbar. Ggf. reicht das fuer RDP trotzdem, da NefCon den Treiber sofort aktiviert."
+          }
+
+          Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+          echo "Virtual Display Driver Setup abgeschlossen."
+
       - name: Enable Remote Desktop (RDP)
         shell: pwsh
         env:
@@ -45,10 +111,8 @@ jobs:
             Write-Error "FEHLER: Secret RDP_PASSWORD ist nicht gesetzt!"
             exit 1
           }
-
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
           # WICHTIG fuer Cloudflare Browser-Rendering: Network Level
           # Authentication (NLA) MUSS deaktiviert werden, sonst schlaegt die
           # Verbindung im Browser fehl, auch wenn alles andere korrekt ist.
@@ -58,10 +122,21 @@ jobs:
           $rdpTcp = Get-CimInstance -Namespace root\cimv2\terminalservices -ClassName Win32_TSGeneralSetting -Filter "TerminalName='RDP-tcp'"
           Invoke-CimMethod -InputObject $rdpTcp -MethodName SetUserAuthenticationRequired -Arguments @{ UserAuthenticationRequired = 0 } | Out-Null
 
+          # Zusaetzlich: Security Layer explizit auf "Negotiate" (1) setzen.
+          # Cloudflare Browser-RDP verlangt TLS/Negotiate, nicht den alten
+          # "RDP Security Layer" (0). NLA-Deaktivierung allein reicht nicht
+          # immer aus, wenn dieser Wert vorher auf 0 stand.
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 1 -Force
+
           $securePw = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
           $user = Get-LocalUser | Where-Object { $_.Name -like "*runneradmin*" -or $_.Name -like "*administrator*" } | Select-Object -First 1
           Set-LocalUser -Name $user.Name -Password $securePw
-          echo "RDP aktiviert (NLA deaktiviert) fuer Benutzer: $($user.Name)"
+
+          # RDP-Dienst neu starten, damit alle obigen Aenderungen (NLA,
+          # SecurityLayer) garantiert fuer die neue Session greifen.
+          Restart-Service -Name TermService -Force
+
+          echo "RDP aktiviert (NLA deaktiviert, SecurityLayer=Negotiate) fuer Benutzer: $($user.Name)"
 
       - name: Start Cloudflare Tunnel
         shell: pwsh
@@ -72,14 +147,12 @@ jobs:
             Write-Error "FEHLER: Secret CLOUDFLARE_TUNNEL_TOKEN ist nicht gesetzt!"
             exit 1
           }
-
           $proc = Start-Process -FilePath "C:\cloudflared.exe" `
             -ArgumentList "tunnel --no-autoupdate run --token $env:TUNNEL_TOKEN" `
             -RedirectStandardOutput "C:\cloudflared.log" `
             -RedirectStandardError "C:\cloudflared_err.log" `
             -WindowStyle Hidden -PassThru
           Start-Sleep -Seconds 15
-
           # Diagnose: pruefen, ob der Prozess noch laeuft, und die Logs
           # ausgeben - so sehen wir sofort den echten Fehlergrund, statt
           # blind auf eine Fehlermeldung im Cloudflare-Dashboard zu warten.
@@ -89,13 +162,11 @@ jobs:
           } else {
             echo "cloudflared laeuft (PID $($proc.Id))."
           }
-
           echo "----- cloudflared.log -----"
           Get-Content "C:\cloudflared.log" -ErrorAction SilentlyContinue
           echo "----- cloudflared_err.log -----"
           Get-Content "C:\cloudflared_err.log" -ErrorAction SilentlyContinue
           echo "----------------------------"
-
           echo "=========================================="
           echo "Remote Desktop laeuft, erreichbar via Cloudflare Access Browser Rendering."
           echo "Oeffne die URL deiner Access Application im Browser."
@@ -107,7 +178,6 @@ jobs:
         run: |
           # Phase 1: Grossteil der Laufzeit "normal" offen halten.
           Start-Sleep -Seconds (325 * 60)
-
           # Naechsten Lauf anstossen, mit ausreichend Puffer vor dem Timeout.
           echo "Stosse naechsten Lauf an (Auto-Neustart)..."
           $headers = @{
@@ -118,7 +188,6 @@ jobs:
           Invoke-RestMethod -Method Post `
             -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/remote-desktop-windows.yml/dispatches" `
             -Headers $headers -Body $body
-
           # Restlichen Puffer offen halten, bis dieser Lauf sauber endet und
           # der wartende Lauf uebernehmen kann.
           Start-Sleep -Seconds (10 * 60)
