@@ -1,4 +1,4 @@
-name: Remote Desktop Runner (Windows, Browser via noVNC, Auto-Restart)
+name: Remote Desktop Runner (Windows, Browser via RDP, Auto-Restart)
 
 on:
   workflow_dispatch:
@@ -34,59 +34,31 @@ jobs:
         shell: pwsh
         run: |
           choco install googlechrome -y --no-progress
-          echo "✅ Chrome installiert."
+          echo "Chrome installiert."
 
-      - name: Install TightVNC Server (silent, mit Passwort)
+      - name: Enable Remote Desktop (RDP)
         shell: pwsh
         env:
-          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          if ([string]::IsNullOrEmpty($env:VNC_PASSWORD)) {
-            Write-Error "FEHLER: Secret VNC_PASSWORD ist nicht gesetzt!"
+          if ([string]::IsNullOrEmpty($env:RDP_PASSWORD)) {
+            Write-Error "FEHLER: Secret RDP_PASSWORD ist nicht gesetzt!"
             exit 1
           }
 
-          Invoke-WebRequest -Uri "https://www.tightvnc.com/download/2.8.85/tightvnc-2.8.85-gpl-setup-64bit.msi" -OutFile "C:\tightvnc.msi"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-          # WICHTIG: VNC-Passwoerter duerfen maximal 8 Zeichen lang sein
-          # (technische Grenze des VNC-Protokolls, keine Einschraenkung von mir).
-          Start-Process msiexec.exe -ArgumentList `
-            "/i", "C:\tightvnc.msi", "/quiet", "/norestart", `
-            "ADDLOCAL=Server", `
-            "SERVER_REGISTER_AS_SERVICE=1", `
-            "SERVER_ADD_FIREWALL_EXCEPTION=1", `
-            "SERVER_ALLOW_SAS=1", `
-            "SET_USEVNCAUTHENTICATION=1", `
-            "VALUE_OF_USEVNCAUTHENTICATION=1", `
-            "SET_PASSWORD=1", `
-            "VALUE_OF_PASSWORD=$env:VNC_PASSWORD" `
-            -Wait
-          echo "✅ TightVNC Server installiert und als Dienst gestartet."
+          # WICHTIG fuer Cloudflare Browser-Rendering: Network Level
+          # Authentication (NLA) MUSS deaktiviert werden, sonst schlaegt die
+          # Verbindung im Browser fehl, auch wenn alles andere korrekt ist.
+          $rdpTcp = Get-WmiObject -Class "Win32_TSGeneralSetting" -Namespace root\cimv2\terminalservices -Filter "TerminalName='RDP-tcp'"
+          $rdpTcp.SetUserAuthenticationRequired(0) | Out-Null
 
-      - name: Install Python websockify & noVNC
-        shell: pwsh
-        run: |
-          # websockify: WebSocket <-> TCP Bruecke, wird als Python-Paket installiert
-          # (Python ist auf windows-latest vorinstalliert).
-          pip install websockify --quiet
-
-          # noVNC: die eigentliche Web-Oberflaeche (HTML/JS), die im Browser
-          # angezeigt wird. Wird per Git-Clone geholt.
-          git clone --depth 1 https://github.com/novnc/noVNC.git C:\noVNC
-          echo "✅ websockify & noVNC installiert."
-
-      - name: Start noVNC Web-Proxy (Port 6080)
-        shell: pwsh
-        run: |
-          # Verbindet den lokalen VNC-Server (Port 5900) mit einer
-          # Web-Oberflaeche auf Port 6080 - darauf zeigt spaeter Cloudflare.
-          Start-Process -FilePath "websockify" `
-            -ArgumentList "--web=C:\noVNC", "6080", "localhost:5900" `
-            -RedirectStandardOutput "C:\websockify.log" `
-            -RedirectStandardError "C:\websockify_err.log" `
-            -WindowStyle Hidden
-          Start-Sleep -Seconds 5
-          echo "✅ noVNC laeuft auf Port 6080."
+          $securePw = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $user = Get-LocalUser | Where-Object { $_.Name -like "*runneradmin*" -or $_.Name -like "*administrator*" } | Select-Object -First 1
+          Set-LocalUser -Name $user.Name -Password $securePw
+          echo "RDP aktiviert (NLA deaktiviert) fuer Benutzer: $($user.Name)"
 
       - name: Start Cloudflare Tunnel
         shell: pwsh
@@ -106,9 +78,9 @@ jobs:
           Start-Sleep -Seconds 5
 
           echo "=========================================="
-          echo "Remote Desktop laeuft, erreichbar via Cloudflare Access."
-          echo "Oeffne https://DEINE-SUBDOMAIN.DEINE-DOMAIN.com/vnc.html im Browser."
-          echo "VNC-Passwort (max. 8 Zeichen) ist das Secret VNC_PASSWORD."
+          echo "Remote Desktop laeuft, erreichbar via Cloudflare Access Browser Rendering."
+          echo "Oeffne die URL deiner Access Application im Browser."
+          echo "Login: Windows-Benutzername + RDP_PASSWORD."
           echo "=========================================="
 
       - name: Keep Alive mit Auto-Neustart
