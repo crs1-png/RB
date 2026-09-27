@@ -30,16 +30,15 @@ jobs:
         run: |
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
 
-      - name: Install Chrome & Google Drive Desktop (silent)
+      - name: Install Chrome (silent)
         shell: powershell
         run: |
           # Chrome über Chocolatey installieren (ist auf GitHub-Runnern vorinstalliert)
           choco install googlechrome -y --no-progress
-
-          # Google Drive Desktop silent installieren
-          Invoke-WebRequest -Uri "https://dl.google.com/drive-file-stream/GoogleDriveSetup.exe" -OutFile "C:\GoogleDriveSetup.exe"
-          Start-Process -FilePath "C:\GoogleDriveSetup.exe" -ArgumentList "--silent","--desktop_shortcut" -Wait
-          echo "✅ Chrome & Google Drive Desktop installiert."
+          echo "✅ Chrome installiert."
+          echo "ℹ️  Google Drive Desktop wurde bewusst entfernt (hing beim Treiber-Setup)."
+          echo "   Öffne stattdessen einfach https://drive.google.com in Chrome,"
+          echo "   oder installiere es bei Bedarf manuell in der laufenden Session."
 
       - name: Enable Remote Desktop (RDP)
         shell: powershell
