@@ -1,4 +1,4 @@
-name: Remote Desktop Runner (Windows, Zero Trust, Auto-Restart)
+name: Remote Desktop Runner (Windows, Browser via noVNC, Auto-Restart)
 
 on:
   workflow_dispatch:
@@ -30,33 +30,63 @@ jobs:
         run: |
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
 
-      - name: Install Chrome (silent)
+      - name: Install Chrome
         shell: pwsh
         run: |
-          # Chrome über Chocolatey installieren (ist auf GitHub-Runnern vorinstalliert)
           choco install googlechrome -y --no-progress
           echo "✅ Chrome installiert."
-          echo "ℹ️  Google Drive Desktop wurde bewusst entfernt (hing beim Treiber-Setup)."
-          echo "   Öffne stattdessen einfach https://drive.google.com in Chrome,"
-          echo "   oder installiere es bei Bedarf manuell in der laufenden Session."
 
-      - name: Enable Remote Desktop (RDP)
+      - name: Install TightVNC Server (silent, mit Passwort)
         shell: pwsh
         env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
-          if ([string]::IsNullOrEmpty($env:RDP_PASSWORD)) {
-            Write-Error "❌ FEHLER: Secret RDP_PASSWORD ist nicht gesetzt!"
+          if ([string]::IsNullOrEmpty($env:VNC_PASSWORD)) {
+            Write-Error "FEHLER: Secret VNC_PASSWORD ist nicht gesetzt!"
             exit 1
           }
 
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Invoke-WebRequest -Uri "https://www.tightvnc.com/download/2.8.85/tightvnc-2.8.85-gpl-setup-64bit.msi" -OutFile "C:\tightvnc.msi"
 
-          $securePw = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-          $user = Get-LocalUser | Where-Object { $_.Name -like "*runneradmin*" -or $_.Name -like "*administrator*" } | Select-Object -First 1
-          Set-LocalUser -Name $user.Name -Password $securePw
-          echo "RDP aktiviert für Benutzer: $($user.Name)"
+          # WICHTIG: VNC-Passwoerter duerfen maximal 8 Zeichen lang sein
+          # (technische Grenze des VNC-Protokolls, keine Einschraenkung von mir).
+          Start-Process msiexec.exe -ArgumentList `
+            "/i", "C:\tightvnc.msi", "/quiet", "/norestart", `
+            "ADDLOCAL=Server", `
+            "SERVER_REGISTER_AS_SERVICE=1", `
+            "SERVER_ADD_FIREWALL_EXCEPTION=1", `
+            "SERVER_ALLOW_SAS=1", `
+            "SET_USEVNCAUTHENTICATION=1", `
+            "VALUE_OF_USEVNCAUTHENTICATION=1", `
+            "SET_PASSWORD=1", `
+            "VALUE_OF_PASSWORD=$env:VNC_PASSWORD" `
+            -Wait
+          echo "✅ TightVNC Server installiert und als Dienst gestartet."
+
+      - name: Install Python websockify & noVNC
+        shell: pwsh
+        run: |
+          # websockify: WebSocket <-> TCP Bruecke, wird als Python-Paket installiert
+          # (Python ist auf windows-latest vorinstalliert).
+          pip install websockify --quiet
+
+          # noVNC: die eigentliche Web-Oberflaeche (HTML/JS), die im Browser
+          # angezeigt wird. Wird per Git-Clone geholt.
+          git clone --depth 1 https://github.com/novnc/noVNC.git C:\noVNC
+          echo "✅ websockify & noVNC installiert."
+
+      - name: Start noVNC Web-Proxy (Port 6080)
+        shell: pwsh
+        run: |
+          # Verbindet den lokalen VNC-Server (Port 5900) mit einer
+          # Web-Oberflaeche auf Port 6080 - darauf zeigt spaeter Cloudflare.
+          Start-Process -FilePath "websockify" `
+            -ArgumentList "--web=C:\noVNC", "6080", "localhost:5900" `
+            -RedirectStandardOutput "C:\websockify.log" `
+            -RedirectStandardError "C:\websockify_err.log" `
+            -WindowStyle Hidden
+          Start-Sleep -Seconds 5
+          echo "✅ noVNC laeuft auf Port 6080."
 
       - name: Start Cloudflare Tunnel
         shell: pwsh
@@ -64,7 +94,7 @@ jobs:
           TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
         run: |
           if ([string]::IsNullOrEmpty($env:TUNNEL_TOKEN)) {
-            Write-Error "❌ FEHLER: Secret CLOUDFLARE_TUNNEL_TOKEN ist nicht gesetzt!"
+            Write-Error "FEHLER: Secret CLOUDFLARE_TUNNEL_TOKEN ist nicht gesetzt!"
             exit 1
           }
 
@@ -76,20 +106,19 @@ jobs:
           Start-Sleep -Seconds 5
 
           echo "=========================================="
-          echo "✅ Remote Desktop läuft, erreichbar via Cloudflare Zero Trust."
-          echo "   Verbinden per: cloudflared access rdp --hostname DEIN-HOSTNAME --url rdp://localhost:3389"
-          echo "   Danach RDP-Client auf localhost:PORT."
-          echo "   Melde dich in Google Drive / Chrome einfach selbst manuell an."
+          echo "Remote Desktop laeuft, erreichbar via Cloudflare Access."
+          echo "Oeffne https://DEINE-SUBDOMAIN.DEINE-DOMAIN.com/vnc.html im Browser."
+          echo "VNC-Passwort (max. 8 Zeichen) ist das Secret VNC_PASSWORD."
           echo "=========================================="
 
       - name: Keep Alive mit Auto-Neustart
         shell: pwsh
         run: |
-          # Phase 1: Großteil der Laufzeit "normal" offen halten.
+          # Phase 1: Grossteil der Laufzeit "normal" offen halten.
           Start-Sleep -Seconds (325 * 60)
 
-          # Nächsten Lauf anstoßen, mit ausreichend Puffer vor dem Timeout.
-          echo "Stoße nächsten Lauf an (Auto-Neustart)..."
+          # Naechsten Lauf anstossen, mit ausreichend Puffer vor dem Timeout.
+          echo "Stosse naechsten Lauf an (Auto-Neustart)..."
           $headers = @{
             Authorization = "Bearer ${{ secrets.GITHUB_TOKEN }}"
             Accept        = "application/vnd.github+json"
@@ -100,6 +129,6 @@ jobs:
             -Headers $headers -Body $body
 
           # Restlichen Puffer offen halten, bis dieser Lauf sauber endet und
-          # der wartende Lauf übernehmen kann.
+          # der wartende Lauf uebernehmen kann.
           Start-Sleep -Seconds (10 * 60)
-          echo "Dieser Lauf endet jetzt - der nachrückende Lauf übernimmt in Kürze."
+          echo "Dieser Lauf endet jetzt - der nachrueckende Lauf uebernimmt in Kuerze."
