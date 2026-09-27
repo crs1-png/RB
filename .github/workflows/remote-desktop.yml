@@ -51,6 +51,99 @@ jobs:
           sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
           rm google-chrome-stable_current_amd64.deb
 
+      - name: Apply Modern Look (Yaru Theme + Chrome Dark Mode)
+        run: |
+          # WARUM YARU: Das ist Ubuntus offizielles, modernes Standard-Theme
+          # (seit Ubuntu 20.04+). Es ist rein CSS/Icon-basiert - kein
+          # Compositing, keine 3D-Effekte, kein GPU-Bedarf. Dadurch bleibt
+          # das System genauso stabil und leicht wie reines XFCE vorher,
+          # sieht aber deutlich moderner/flacher aus (dunkles Design).
+          #
+          # WARUM NICHT xfconf-query: Das Setzen von Themes zur Laufzeit
+          # braucht eine laufende D-Bus/XFCE-Session. Stattdessen schreiben
+          # wir die Konfigurationsdateien direkt VOR dem Start von XFCE -
+          # das ist deterministischer und vermeidet Race-Conditions.
+          sudo apt-get install -y \
+            yaru-theme-gtk \
+            yaru-theme-icon \
+            yaru-theme-window-manager \
+            fonts-ubuntu \
+            fonts-noto-color-emoji
+
+          mkdir -p ~/.config/xfce4/xfconf/xfce-perchannel-xml
+
+          # xsettings: GTK-Theme (Fensterinhalte, Buttons, Menüs) + Icons +
+          # Schriftart auf Yaru-Dark / Ubuntu-Font umstellen.
+          cat > ~/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xsettings" version="1.0">
+            <property name="Net" type="empty">
+              <property name="ThemeName" type="string" value="Yaru-dark"/>
+              <property name="IconThemeName" type="string" value="Yaru"/>
+            </property>
+            <property name="Gtk" type="empty">
+              <property name="FontName" type="string" value="Ubuntu 10"/>
+              <property name="CursorThemeName" type="string" value="Yaru"/>
+            </property>
+          </channel>
+          EOF
+
+          # xfwm4: Fensterrahmen/Titelleisten-Theme ebenfalls auf Yaru-Dark.
+          cat > ~/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfwm4" version="1.0">
+            <property name="general" type="empty">
+              <property name="theme" type="string" value="Yaru-dark"/>
+              <property name="title_font" type="string" value="Ubuntu Bold 9"/>
+              <property name="button_layout" type="string" value="O|HMC"/>
+            </property>
+          </channel>
+          EOF
+
+          # Desktop-Hintergrund: dezentes dunkles Blau-Grau statt XFCE-
+          # Standardmuster - ruhiger, moderner Look, keine Abhaengigkeit
+          # von einem Wallpaper-Bild-Paket.
+          cat > ~/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-desktop" version="1.0">
+            <property name="backdrop" type="empty">
+              <property name="screen0" type="empty">
+                <property name="monitor0" type="empty">
+                  <property name="workspace0" type="empty">
+                    <property name="color-style" type="int" value="0"/>
+                    <property name="image-style" type="int" value="0"/>
+                    <property name="rgba1" type="array">
+                      <value type="double" value="0.114"/>
+                      <value type="double" value="0.137"/>
+                      <value type="double" value="0.176"/>
+                      <value type="double" value="1.0"/>
+                    </property>
+                  </property>
+                </property>
+              </property>
+            </property>
+          </channel>
+          EOF
+
+          # Chrome-Startlink auf dem Desktop: startet maximiert und im
+          # systemweiten Dark Mode (passt zu Yaru-Dark), ohne die "Chrome
+          # wurde nicht richtig beendet"-Meldung.
+          mkdir -p ~/Desktop
+          cat > ~/Desktop/google-chrome.desktop << 'EOF'
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=Google Chrome
+          Comment=Web-Browser (Dark Mode)
+          Exec=/usr/bin/google-chrome-stable --force-dark-mode --enable-features=WebUIDarkMode --start-maximized --no-first-run --disable-session-crashed-bubble %U
+          Icon=google-chrome
+          Terminal=false
+          Categories=Network;WebBrowser;
+          EOF
+          chmod +x ~/Desktop/google-chrome.desktop
+
+          echo "Yaru-Dark Theme + Chrome Dark-Mode-Launcher eingerichtet."
+
       - name: Install Cloudflared
         run: |
           curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
@@ -63,7 +156,8 @@ jobs:
           export DISPLAY=:99
           sleep 2
 
-          # XFCE Desktop-Umgebung starten
+          # XFCE Desktop-Umgebung starten (liest jetzt automatisch die
+          # zuvor geschriebenen Yaru-Dark-Konfigurationsdateien ein)
           startxfce4 &
           sleep 5
 
