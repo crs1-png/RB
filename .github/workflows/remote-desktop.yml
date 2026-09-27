@@ -211,13 +211,65 @@ jobs:
           echo "Login: Windows-Benutzername + RDP_PASSWORD."
           echo "=========================================="
 
-      - name: Keep Alive mit Auto-Neustart
+      - name: Keep Alive mit Auto-Neustart und cloudflared-Ueberwachung
         shell: pwsh
+        env:
+          TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
         run: |
-          # Phase 1: Grossteil der Laufzeit "normal" offen halten.
-          Start-Sleep -Seconds (325 * 60)
-          # Naechsten Lauf anstossen, mit ausreichend Puffer vor dem Timeout.
+          # PROBLEM (behoben durch diesen Step): Vorher wurde cloudflared nur
+          # EINMALIG kurz nach dem Start geprueft. Ist der Prozess spaeter
+          # (z.B. nach Minuten/Stunden) abgestuerzt - Netzwerk-Haenger,
+          # Ressourcenproblem, o.ae. - hat das niemand bemerkt, weil danach
+          # nur noch "Start-Sleep" ohne jede Kontrolle lief. Im Cloudflare-
+          # Dashboard erschien der Tunnel dann als "Down", ohne dass der
+          # GitHub-Actions-Job das erkannt oder reagiert hat.
+          #
+          # LOESUNG: Statt einmal 325 Minuten am Stueck zu schlafen, wird
+          # der Tunnel alle 60 Sekunden aktiv geprueft und bei Bedarf sofort
+          # neu gestartet. So bleibt der Remote-Desktop-Zugriff durchgehend
+          # verfuegbar, und im Log siehst du jederzeit den aktuellen Status.
+
+          $endTime = (Get-Date).AddMinutes(325)
+          $checkIntervalSeconds = 60
+          $cloudflaredPath = "C:\cloudflared.exe"
+
+          function Start-CloudflaredTunnel {
+            $p = Start-Process -FilePath $cloudflaredPath `
+              -ArgumentList "tunnel --no-autoupdate run --token $env:TUNNEL_TOKEN" `
+              -RedirectStandardOutput "C:\cloudflared.log" `
+              -RedirectStandardError "C:\cloudflared_err.log" `
+              -WindowStyle Hidden -PassThru
+            return $p
+          }
+
+          $cfProcess = Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $cfProcess) {
+            echo "$(Get-Date -Format 'HH:mm:ss') - cloudflared laeuft nicht mehr, starte neu..."
+            $cfProcess = Start-CloudflaredTunnel
+          }
+
+          $restartCount = 0
+          while ((Get-Date) -lt $endTime) {
+            Start-Sleep -Seconds $checkIntervalSeconds
+
+            $stillAlive = Get-Process -Id $cfProcess.Id -ErrorAction SilentlyContinue
+            if ($null -eq $stillAlive) {
+              $restartCount++
+              echo "$(Get-Date -Format 'HH:mm:ss') - WARNUNG: cloudflared ist abgestuerzt! Starte neu (Neustart Nr. $restartCount)..."
+              echo "----- Letzte cloudflared_err.log Zeilen vor Absturz -----"
+              Get-Content "C:\cloudflared_err.log" -Tail 20 -ErrorAction SilentlyContinue
+              echo "----------------------------------------------------------"
+              $cfProcess = Start-CloudflaredTunnel
+              Start-Sleep -Seconds 10
+            } else {
+              echo "$(Get-Date -Format 'HH:mm:ss') - cloudflared laeuft normal (PID $($cfProcess.Id)). Bisherige Neustarts: $restartCount"
+            }
+          }
+
+          echo "=========================================="
+          echo "Phase 1 (325 Min.) beendet. Insgesamt $restartCount Neustart(s) von cloudflared."
           echo "Stosse naechsten Lauf an (Auto-Neustart)..."
+          echo "=========================================="
           $headers = @{
             Authorization = "Bearer ${{ secrets.GITHUB_TOKEN }}"
             Accept        = "application/vnd.github+json"
@@ -226,7 +278,16 @@ jobs:
           Invoke-RestMethod -Method Post `
             -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/remote-desktop-windows.yml/dispatches" `
             -Headers $headers -Body $body
+
           # Restlichen Puffer offen halten, bis dieser Lauf sauber endet und
-          # der wartende Lauf uebernehmen kann.
-          Start-Sleep -Seconds (10 * 60)
+          # der wartende Lauf uebernehmen kann. Auch hier weiterhin ueberwachen
+          # statt blind zu schlafen.
+          $finalEndTime = (Get-Date).AddMinutes(10)
+          while ((Get-Date) -lt $finalEndTime) {
+            Start-Sleep -Seconds $checkIntervalSeconds
+            $stillAlive = Get-Process -Id $cfProcess.Id -ErrorAction SilentlyContinue
+            if ($null -eq $stillAlive) {
+              $cfProcess = Start-CloudflaredTunnel
+            }
+          }
           echo "Dieser Lauf endet jetzt - der nachrueckende Lauf uebernimmt in Kuerze."
