@@ -36,6 +36,31 @@ jobs:
           choco install googlechrome -y --no-progress
           echo "Chrome installiert."
 
+      - name: Interne IP-Adresse ermitteln (wichtig fuer die RDP-URL)
+        shell: pwsh
+        run: |
+          # WICHTIG: 127.0.0.1 (Loopback) funktioniert NICHT als Ziel fuer
+          # Cloudflares CIDR-Routing/Browser-RDP! Pakete, die "von aussen"
+          # (ueber den Tunnel) an 127.0.0.1 adressiert sind, werden von
+          # Windows als ungueltig verworfen -> "WSA 10065 no route to host".
+          #
+          # Stattdessen muss die ECHTE interne IP-Adresse des Runners
+          # verwendet werden. Diese IP ist bei JEDEM Lauf neu (ephemere VM),
+          # daher wird sie hier klar sichtbar ausgegeben, damit du sie fuer
+          # die RDP-Direct-URL kopieren kannst:
+          # https://<app-domain>/rdp/<vnet-id>/<DIESE-IP>/3389
+          $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                 Where-Object {
+                   $_.IPAddress -ne "127.0.0.1" -and
+                   $_.IPAddress -notlike "169.254.*" -and
+                   $_.PrefixOrigin -ne "WellKnown"
+                 } | Select-Object -First 1).IPAddress
+
+          echo "=========================================="
+          echo "  INTERNE IP FUER DIESEN LAUF: $ip"
+          echo "  (Diese IP fuer die RDP-URL statt 127.0.0.1 verwenden!)"
+          echo "=========================================="
+
       - name: Install Virtual Display Driver (Fix fuer schwarzen/blauen RDP-Bildschirm)
         shell: pwsh
         run: |
