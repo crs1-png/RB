@@ -52,8 +52,11 @@ jobs:
           # WICHTIG fuer Cloudflare Browser-Rendering: Network Level
           # Authentication (NLA) MUSS deaktiviert werden, sonst schlaegt die
           # Verbindung im Browser fehl, auch wenn alles andere korrekt ist.
-          $rdpTcp = Get-WmiObject -Class "Win32_TSGeneralSetting" -Namespace root\cimv2\terminalservices -Filter "TerminalName='RDP-tcp'"
-          $rdpTcp.SetUserAuthenticationRequired(0) | Out-Null
+          # (Get-CimInstance statt Get-WmiObject, da Get-WmiObject unter
+          # pwsh/PowerShell 7 nur "tote" Objekte ohne Methoden liefert und
+          # sonst der Fehler "does not contain a method" auftritt.)
+          $rdpTcp = Get-CimInstance -Namespace root\cimv2\terminalservices -ClassName Win32_TSGeneralSetting -Filter "TerminalName='RDP-tcp'"
+          Invoke-CimMethod -InputObject $rdpTcp -MethodName SetUserAuthenticationRequired -Arguments @{ UserAuthenticationRequired = 0 } | Out-Null
 
           $securePw = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
           $user = Get-LocalUser | Where-Object { $_.Name -like "*runneradmin*" -or $_.Name -like "*administrator*" } | Select-Object -First 1
