@@ -26,12 +26,12 @@ jobs:
 
     steps:
       - name: Install Cloudflared
-        shell: powershell
+        shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
 
       - name: Install Chrome (silent)
-        shell: powershell
+        shell: pwsh
         run: |
           # Chrome über Chocolatey installieren (ist auf GitHub-Runnern vorinstalliert)
           choco install googlechrome -y --no-progress
@@ -41,7 +41,7 @@ jobs:
           echo "   oder installiere es bei Bedarf manuell in der laufenden Session."
 
       - name: Enable Remote Desktop (RDP)
-        shell: powershell
+        shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
@@ -59,7 +59,7 @@ jobs:
           echo "RDP aktiviert für Benutzer: $($user.Name)"
 
       - name: Start Cloudflare Tunnel
-        shell: powershell
+        shell: pwsh
         env:
           TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
         run: |
@@ -83,7 +83,7 @@ jobs:
           echo "=========================================="
 
       - name: Keep Alive mit Auto-Neustart
-        shell: powershell
+        shell: pwsh
         run: |
           # Phase 1: Großteil der Laufzeit "normal" offen halten.
           Start-Sleep -Seconds (325 * 60)
