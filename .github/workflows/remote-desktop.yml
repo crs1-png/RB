@@ -73,12 +73,28 @@ jobs:
             exit 1
           }
 
-          Start-Process -FilePath "C:\cloudflared.exe" `
+          $proc = Start-Process -FilePath "C:\cloudflared.exe" `
             -ArgumentList "tunnel --no-autoupdate run --token $env:TUNNEL_TOKEN" `
             -RedirectStandardOutput "C:\cloudflared.log" `
             -RedirectStandardError "C:\cloudflared_err.log" `
-            -WindowStyle Hidden
-          Start-Sleep -Seconds 5
+            -WindowStyle Hidden -PassThru
+          Start-Sleep -Seconds 15
+
+          # Diagnose: pruefen, ob der Prozess noch laeuft, und die Logs
+          # ausgeben - so sehen wir sofort den echten Fehlergrund, statt
+          # blind auf eine Fehlermeldung im Cloudflare-Dashboard zu warten.
+          $stillRunning = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+          if ($null -eq $stillRunning) {
+            Write-Error "FEHLER: cloudflared ist sofort abgestuerzt/beendet! Log-Ausgabe folgt:"
+          } else {
+            echo "cloudflared laeuft (PID $($proc.Id))."
+          }
+
+          echo "----- cloudflared.log -----"
+          Get-Content "C:\cloudflared.log" -ErrorAction SilentlyContinue
+          echo "----- cloudflared_err.log -----"
+          Get-Content "C:\cloudflared_err.log" -ErrorAction SilentlyContinue
+          echo "----------------------------"
 
           echo "=========================================="
           echo "Remote Desktop laeuft, erreichbar via Cloudflare Access Browser Rendering."
