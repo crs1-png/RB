@@ -25,43 +25,57 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" /opt/hostedtoolcache /usr/local/lib/android || true
           docker system prune -af --volumes || true
 
-      - name: Install GNOME Desktop Environment, Chrome & Online Accounts
+      - name: Install GNOME Flashback, Chrome, Online Accounts & Google Drive
         run: |
+          export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update
           sudo apt-get install -y \
             gnome-session-flashback \
+            gnome-flashback \
+            gnome-panel \
             metacity \
             gnome-control-center \
             gnome-online-accounts \
+            gnome-keyring \
+            gvfs \
+            gvfs-backends \
             nautilus \
             gnome-terminal \
+            adwaita-icon-theme \
             xvfb \
+            x11-utils \
             x11vnc \
             novnc \
             websockify \
             curl \
             wget \
             dbus-x11 \
-            libnss3-tools
+            libnss3-tools \
+            openssl
 
           # Google Chrome installieren
           wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
-          rm google-chrome-stable_current_amd64.deb
+          rm -f google-chrome-stable_current_amd64.deb
 
       - name: Install Cloudflare Root CA Certificate (TLS Decryption)
         run: |
-          # 1. Cloudflare Root CA von stabilem CDN beziehen
-          sudo mkdir -p /usr/local/share/ca-certificates/
-          sudo curl -fsSL "https://developers.cloudflare.com/cloudflare-one/static/Cloudflare_CA.pem" -o /usr/local/share/ca-certificates/Cloudflare_CA.crt || \
-          sudo curl -fsSL "https://pkg.cloudflare.com/cloudflare-main-ca.crt" -o /usr/local/share/ca-certificates/Cloudflare_CA.crt
+          CERT=/tmp/Cloudflare_CA.crt
+          curl -fsSL "https://developers.cloudflare.com/cloudflare-one/static/Cloudflare_CA.pem" -o "$CERT" || true
 
-          sudo update-ca-certificates
+          # Nur importieren, wenn wirklich ein gültiges Zertifikat geladen wurde
+          if openssl x509 -in "$CERT" -noout 2>/dev/null; then
+            sudo cp "$CERT" /usr/local/share/ca-certificates/Cloudflare_CA.crt
+            sudo update-ca-certificates
 
-          # 2. In die NSS-Datenbank für Chrome importieren
-          mkdir -p ~/.pki/nssdb
-          certutil -d sql:$HOME/.pki/nssdb -N --empty-password
-          certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "Cloudflare Root CA" -i /usr/local/share/ca-certificates/Cloudflare_CA.crt
+            # In die NSS-Datenbank für Chrome importieren
+            mkdir -p ~/.pki/nssdb
+            [ -f ~/.pki/nssdb/cert9.db ] || certutil -d sql:$HOME/.pki/nssdb -N --empty-password
+            certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "Cloudflare Root CA" -i "$CERT"
+            echo "✅ Cloudflare Root CA installiert."
+          else
+            echo "⚠️ Cloudflare Root CA konnte nicht geladen werden – wird übersprungen."
+          fi
 
       - name: Start Official Cloudflare WARP Zero Trust Proxy Container
         env:
@@ -74,105 +88,203 @@ jobs:
             exit 1
           fi
 
-          # 1. Start an Ubuntu container to host official Cloudflare WARP
+          # 1. Ubuntu-Container für den offiziellen WARP-Client
           docker run -d \
             --name warp-proxy \
             --privileged \
-            --restart always \
+            --cap-add NET_ADMIN \
             -p 127.0.0.1:1080:1080 \
             ubuntu:22.04 sleep infinity
 
-          # 2. Install official Cloudflare WARP package inside the container
+          # 2. Offizielles cloudflare-warp Paket installieren
           docker exec warp-proxy bash -c "
-            apt-get update && apt-get install -y curl gnupg lsb-release
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y curl gnupg lsb-release ca-certificates dbus socat
             curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-            echo 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ jammy main' | tee /etc/apt/sources.list.d/cloudflare-client.list
-            apt-get update && apt-get install -y cloudflare-warp socat
+            echo 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ jammy main' > /etc/apt/sources.list.d/cloudflare-client.list
+            apt-get update
+            apt-get install -y cloudflare-warp
           "
 
-          # 3. Start daemon, configure SOCKS5 mode, enroll Service Token, and expose port 1080
-          docker exec -d warp-proxy warp-svc
-          sleep 5
+          # 3. Zero-Trust-Anmeldung per Service Token über mdm.xml (Proxy-Modus auf Port 4000)
+          umask 077
+          cat > /tmp/mdm.xml << EOF
+          <dict>
+            <key>organization</key>
+            <string>${WARP_ORGANIZATION}</string>
+            <key>auth_client_id</key>
+            <string>${WARP_AUTH_CLIENT_ID}</string>
+            <key>auth_client_secret</key>
+            <string>${WARP_AUTH_CLIENT_SECRET}</string>
+            <key>service_mode</key>
+            <string>proxy</string>
+            <key>proxy_port</key>
+            <integer>4000</integer>
+            <key>auto_connect</key>
+            <integer>1</integer>
+            <key>onboarding</key>
+            <false/>
+          </dict>
+          EOF
+          docker exec warp-proxy mkdir -p /var/lib/cloudflare-warp
+          docker cp /tmp/mdm.xml warp-proxy:/var/lib/cloudflare-warp/mdm.xml
+          rm -f /tmp/mdm.xml
 
-          docker exec warp-proxy bash -c "
-            warp-cli --accept-tos registration new
-            warp-cli --accept-tos mode proxy
-            warp-cli --accept-tos proxy port 4000
-            warp-cli --accept-tos teams-enroll-token organization $WARP_ORGANIZATION auth-client-id $WARP_AUTH_CLIENT_ID auth-client-secret $WARP_AUTH_CLIENT_SECRET || \
-            warp-cli --accept-tos connector token --org $WARP_ORGANIZATION --id $WARP_AUTH_CLIENT_ID --secret $WARP_AUTH_CLIENT_SECRET
-            warp-cli --accept-tos connect
-          "
+          # 4. System-D-Bus und WARP-Dienst starten
+          docker exec warp-proxy bash -c "mkdir -p /run/dbus && rm -f /run/dbus/pid && dbus-daemon --config-file=/usr/share/dbus-1/system.conf --fork"
+          docker exec -d warp-proxy bash -c "warp-svc > /var/log/warp-svc.log 2>&1"
 
-          # Forward internal WARP SOCKS proxy (4000) to container port 1080 bound to host
-          docker exec -d warp-proxy socat TCP-LISTEN:1080,fork,reuseaddr TCP:127.0.0.1:4000
-          sleep 5
+          # 5. Auf Verbindung warten (max. ~90 Sekunden)
+          CONNECTED=0
+          for i in $(seq 1 30); do
+            sleep 3
+            if docker exec warp-proxy warp-cli --accept-tos status 2>/dev/null | grep -q "Connected"; then
+              CONNECTED=1; break
+            fi
+            [ "$i" = "10" ] && docker exec warp-proxy warp-cli --accept-tos connect || true
+          done
 
-          # Status prüfen
-          docker exec warp-proxy warp-cli --accept-tos status
+          # 6. Internen WARP-Proxy (4000) auf Container-Port 1080 weiterleiten
+          docker exec -d warp-proxy socat TCP-LISTEN:1080,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:4000
+          sleep 2
 
-      - name: Configure GNOME Dark Theme & Launchers
+          docker exec warp-proxy warp-cli --accept-tos status || true
+          if [ "$CONNECTED" = "1" ]; then
+            echo "✅ WARP verbunden. Test über den Proxy:"
+            curl -s --max-time 15 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -E "warp=|gateway=" || true
+          else
+            echo "⚠️ WARP ist NICHT verbunden. Chrome lädt dann keine Seiten (kein Datenleck)."
+            docker exec warp-proxy tail -n 50 /var/log/warp-svc.log || true
+          fi
+
+      - name: Configure Launchers & Desktop Session Script
         run: |
-          # Settings-Pfad erstellen
-          mkdir -p ~/.config/autostart
+          mkdir -p ~/.config/autostart ~/Desktop ~/.local/share/applications
 
-          # Chrome-Startlink auf dem Desktop einrichten (geroutet über WARP SOCKS5 Proxy)
-          mkdir -p ~/Desktop
+          # Chrome-Starter (geroutet über WARP SOCKS5 Proxy)
           cat > ~/Desktop/google-chrome.desktop << 'EOF'
           [Desktop Entry]
           Version=1.0
           Type=Application
           Name=Google Chrome (WARP ZT)
           Comment=Web-Browser via Cloudflare Zero Trust
-          Exec=/usr/bin/google-chrome-stable --proxy-server="socks5://127.0.0.1:1080" --force-dark-mode --enable-features=WebUIDarkMode --start-maximized --no-first-run --disable-session-crashed-bubble %U
+          Exec=/usr/bin/google-chrome-stable --proxy-server="socks5://127.0.0.1:1080" --force-dark-mode --enable-features=WebUIDarkMode --start-maximized --no-first-run --no-default-browser-check --disable-session-crashed-bubble --disable-dev-shm-usage --password-store=basic %U
           Icon=google-chrome
           Terminal=false
           Categories=Network;WebBrowser;
           EOF
-          chmod +x ~/Desktop/google-chrome.desktop
 
-          # Verknüpfung für GNOME Settings auf dem Desktop
+          # GNOME Settings (Online Accounts -> Google Drive)
           cat > ~/Desktop/gnome-control-center.desktop << 'EOF'
           [Desktop Entry]
           Version=1.0
           Type=Application
-          Name=Settings
-          Comment=GNOME Settings (Online Accounts)
-          Exec=gnome-control-center
+          Name=Settings (Online Accounts)
+          Comment=GNOME Settings – Google-Konto für Google Drive hinzufügen
+          Exec=env XDG_CURRENT_DESKTOP=GNOME gnome-control-center online-accounts
           Icon=org.gnome.Settings
           Terminal=false
           Categories=Settings;
           EOF
-          chmod +x ~/Desktop/gnome-control-center.desktop
+
+          # Dateimanager (Google Drive erscheint links nach Anmeldung)
+          cat > ~/Desktop/nautilus.desktop << 'EOF'
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=Dateien (Google Drive)
+          Exec=nautilus --new-window
+          Icon=org.gnome.Nautilus
+          Terminal=false
+          Categories=Utility;
+          EOF
+
+          chmod +x ~/Desktop/*.desktop
+          cp ~/Desktop/*.desktop ~/.local/share/applications/
+
+          # Desktop-Sitzung OHNE gnome-session (verhindert "Oh no! Something has gone wrong")
+          # Ein Wächter startet abgestürzte Teile automatisch neu.
+          cat > ~/desktop-session.sh << 'EOF'
+          #!/bin/bash
+          export DISPLAY=:99
+          export XDG_SESSION_TYPE=x11
+          export XDG_CURRENT_DESKTOP=GNOME-Flashback:GNOME
+          export XDG_SESSION_DESKTOP=gnome-flashback-metacity
+          export DESKTOP_SESSION=gnome-flashback-metacity
+          export NO_AT_BRIDGE=1
+          export XDG_RUNTIME_DIR="/tmp/runtime-$(id -u)"
+          mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+
+          # Eigene D-Bus-Sitzung
+          eval "$(dbus-launch --sh-syntax)"
+          export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
+
+          # Schlüsselbund mit leerem Passwort entsperren (für Online Accounts / Google Drive)
+          echo -n "" | gnome-keyring-daemon --unlock --components=secrets,pkcs11 >/dev/null 2>&1 || true
+          eval "$(gnome-keyring-daemon --start --components=secrets,pkcs11 2>/dev/null)" || true
+          export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
+
+          # Dark Theme & Desktop-Symbole
+          gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark' || true
+          gsettings set org.gnome.desktop.interface gtk-theme 'Adwaita-dark' || true
+          gsettings set org.gnome.gnome-flashback desktop true || true
+          gsettings set org.gnome.desktop.screensaver lock-enabled false || true
+          gsettings set org.gnome.desktop.session idle-delay 0 || true
+          for f in "$HOME"/Desktop/*.desktop; do gio set "$f" metadata::trusted true 2>/dev/null || true; done
+
+          start_if_missing() {
+            local name="$1"; shift
+            if ! pgrep -u "$(id -u)" -x "$name" >/dev/null; then
+              echo "$(date '+%H:%M:%S') starte $name"
+              "$@" >> "/tmp/desktop-$name.log" 2>&1 &
+              sleep 2
+            fi
+          }
+
+          while true; do
+            start_if_missing metacity metacity --replace
+            start_if_missing gnome-flashback gnome-flashback
+            start_if_missing gnome-panel gnome-panel
+            sleep 5
+          done
+          EOF
+          chmod +x ~/desktop-session.sh
 
       - name: Install Cloudflared
         run: |
-          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          curl -fsSL --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
+          rm -f cloudflared.deb
 
       - name: Start Display & GNOME Desktop Services
         run: |
           # 1. Virtuelles Display starten
-          Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset &
-          export DISPLAY=:99
-          sleep 2
+          nohup Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
+          for i in $(seq 1 20); do
+            xdpyinfo -display :99 >/dev/null 2>&1 && break
+            sleep 1
+          done
+          xdpyinfo -display :99 >/dev/null 2>&1 || { echo "❌ Xvfb startet nicht"; cat /tmp/xvfb.log; exit 1; }
 
-          # 2. D-Bus Instanz starten und Umgebungsvariablen exportieren
-          eval $(dbus-launch --sh-syntax)
-          export DBUS_SESSION_BUS_ADDRESS
-          export DBUS_SESSION_BUS_PID
+          # 2. Desktop-Sitzung mit Wächter starten (läuft unabhängig weiter)
+          nohup setsid bash ~/desktop-session.sh > /tmp/desktop-session.log 2>&1 &
+          sleep 8
 
-          # 3. GNOME Desktop & Metacity Window Manager im Hintergrund starten
-          metacity --replace &
-          gnome-session --session=gnome-flashback-metacity --disable-acceleration-check &
-          sleep 5
-
-          # 4. VNC-Server ohne Passwort auf Display :99 starten
+          # 3. VNC-Server ohne Passwort, nur lokal (Zugriff nur über Cloudflare Access)
           x11vnc -nopw -localhost -rfbport 5900 -forever -shared -display :99 -bg -o /tmp/x11vnc.log
           sleep 2
 
-          # 5. noVNC Web-Proxy (Port 6080) starten
-          websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
+          # 4. noVNC Web-Proxy (Port 6080, nur lokal)
+          nohup websockify --web=/usr/share/novnc/ 127.0.0.1:6080 localhost:5900 > /tmp/websockify.log 2>&1 &
           sleep 2
+
+          echo "--- Desktop-Status ---"
+          cat /tmp/desktop-session.log
+          pgrep -a -x metacity || echo "⚠️ metacity läuft nicht"
+          pgrep -a -x gnome-flashback || echo "⚠️ gnome-flashback läuft nicht"
+          pgrep -a -x gnome-panel || echo "⚠️ gnome-panel läuft nicht"
 
       - name: Start Cloudflare Tunnel
         env:
@@ -192,18 +304,30 @@ jobs:
           echo "=========================================="
 
       - name: Keep Alive (mit Auto-Neustart vor Ablauf)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
+          health() {
+            pgrep -x Xvfb >/dev/null       || echo "⚠️ Xvfb läuft nicht mehr"
+            pgrep -x x11vnc >/dev/null     || echo "⚠️ x11vnc läuft nicht mehr"
+            pgrep -x cloudflared >/dev/null || echo "⚠️ cloudflared läuft nicht mehr"
+          }
+
           echo "Phase 1: 325 Minuten aktiv..."
           for i in $(seq 1 325); do
             sleep 60
+            [ $((i % 15)) -eq 0 ] && { echo "Minute $i"; health; }
           done
 
-          echo "Stoße nächsten Lauf an (Auto-Neustart)..."
+          # Dateiname des Workflows automatisch ermitteln
+          WF_FILE=$(basename "${WORKFLOW_REF%@*}")
+          echo "Stoße nächsten Lauf an (Auto-Neustart) für $WF_FILE ..."
           curl -s -X POST \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/remote-desktop.yml/dispatches" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$WF_FILE/dispatches" \
             -d "{\"ref\":\"${{ github.ref_name }}\"}"
 
           echo "Phase 2: restliche 10 Minuten aktiv..."
