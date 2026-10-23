@@ -62,7 +62,7 @@ jobs:
           certutil -d sql:$HOME/.pki/nssdb -N --empty-password
           certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "Cloudflare Root CA" -i /usr/local/share/ca-certificates/Cloudflare_CA.crt
 
-      - name: Start Isolated WARP Zero Trust Proxy Container
+      - name: Start Official Cloudflare WARP Zero Trust Proxy Container
         env:
           WARP_ORGANIZATION: ${{ secrets.WARP_ORGANIZATION }}
           WARP_AUTH_CLIENT_ID: ${{ secrets.WARP_AUTH_CLIENT_ID }}
@@ -73,18 +73,40 @@ jobs:
             exit 1
           fi
 
-          # WARP Container mit SOCKS5 Proxy & Teams Authentifizierung starten
+          # 1. Start an Ubuntu container to host official Cloudflare WARP
           docker run -d \
             --name warp-proxy \
             --privileged \
             --restart always \
             -p 127.0.0.1:1080:1080 \
-            -e WARP_ORGANIZATION="$WARP_ORGANIZATION" \
-            -e WARP_AUTH_CLIENT_ID="$WARP_AUTH_CLIENT_ID" \
-            -e WARP_AUTH_CLIENT_SECRET="$WARP_AUTH_CLIENT_SECRET" \
-            cmulk/warp-socks5:latest
+            ubuntu:22.04 sleep infinity
 
-          sleep 10
+          # 2. Install official Cloudflare WARP package inside the container
+          docker exec warp-proxy bash -c "
+            apt-get update && apt-get install -y curl gnupg lsb-release
+            curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+            echo 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ jammy main' | tee /etc/apt/sources.list.d/cloudflare-client.list
+            apt-get update && apt-get install -y cloudflare-warp socat
+          "
+
+          # 3. Start daemon, configure SOCKS5 mode, enroll Service Token, and expose port 1080
+          docker exec -d warp-proxy warp-svc
+          sleep 5
+
+          docker exec warp-proxy bash -c "
+            warp-cli --accept-tos registration new
+            warp-cli --accept-tos mode proxy
+            warp-cli --accept-tos proxy port 4000
+            warp-cli --accept-tos teams-enroll-token organization $WARP_ORGANIZATION auth-client-id $WARP_AUTH_CLIENT_ID auth-client-secret $WARP_AUTH_CLIENT_SECRET || \
+            warp-cli --accept-tos connector token --org $WARP_ORGANIZATION --id $WARP_AUTH_CLIENT_ID --secret $WARP_AUTH_CLIENT_SECRET
+            warp-cli --accept-tos connect
+          "
+
+          # Forward internal WARP SOCKS proxy (4000) to container port 1080 bound to host
+          docker exec -d warp-proxy socat TCP-LISTEN:1080,fork,reuseaddr TCP:127.0.0.1:4000
+          sleep 5
+
+          # Status prüfen
           docker exec warp-proxy warp-cli --accept-tos status
 
       - name: Configure GNOME Dark Theme & Launchers
