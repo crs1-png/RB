@@ -1,19 +1,11 @@
-name: Remote Desktop Runner (Zero Trust, Auto-Restart)
+name: Remote Desktop Runner (GNOME + Google Drive, Zero Trust, Auto-Restart)
 
 on:
   workflow_dispatch:
-  # Sicherheitsnetz: prüft alle 30 Minuten nach, ob die Auto-Neustart-Kette
-  # (siehe letzter Schritt im Job) noch läuft. Läuft bereits eine Session,
-  # passiert dank "concurrency" unten nichts Schädliches - der Trigger
-  # wird einfach ignoriert bzw. ersetzt. Ist die Kette abgerissen
-  # (z.B. Absturz, harter Timeout), startet dieser Cron sie neu.
+  # Sicherheitsnetz: prüft alle 30 Minuten nach, ob die Auto-Neustart-Kette noch läuft.
   schedule:
     - cron: '*/30 * * * *'
 
-# Genau 1 laufender + 1 wartender Lauf pro Gruppe (Standardverhalten von
-# GitHub Actions). cancel-in-progress: false ist WICHTIG - sonst würde ein
-# neuer, nachrückender Lauf den noch aktiven Desktop sofort abwürgen,
-# statt sauber zu warten, bis der alte fertig ist.
 concurrency:
   group: remote-desktop
   cancel-in-progress: false
@@ -33,111 +25,34 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" /opt/hostedtoolcache /usr/local/lib/android || true
           docker system prune -af --volumes || true
 
-      - name: Install Desktop Environment & Chrome
+      - name: Install GNOME Desktop Environment, Chrome & Online Accounts
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            xfce4 \
-            xfce4-terminal \
+            gnome-session-flashback \
+            gnome-control-center \
+            gnome-online-accounts \
+            nautilus \
+            gnome-terminal \
             xvfb \
             x11vnc \
             novnc \
             websockify \
             curl \
-            wget
+            wget \
+            dbus-x11
 
           # Google Chrome installieren
           wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
           rm google-chrome-stable_current_amd64.deb
 
-      - name: Apply Modern Look (Yaru Theme + Chrome Dark Mode)
+      - name: Configure GNOME Dark Theme & Launchers
         run: |
-          # WARUM YARU (fuer Inhalte): Das ist Ubuntus offizielles, modernes
-          # Standard-Theme (seit Ubuntu 20.04+) fuer App-Fensterinhalte und
-          # Icons. Es ist rein CSS/Icon-basiert - kein Compositing, keine
-          # 3D-Effekte, kein GPU-Bedarf.
-          #
-          # HINWEIS: Es gibt auf Ubuntu KEIN offizielles apt-Paket fuer ein
-          # Yaru-XFWM4-Fensterrahmen-Theme (das existiert nur als Arch-
-          # Linux-AUR-Paket bzw. muesste aufwendig aus dem Yaru-Quellcode
-          # kompiliert werden - unnoetig fragil). Stattdessen nutzen wir
-          # "arc-theme": eines der wenigen offiziellen Ubuntu-Pakete, das
-          # bereits ein fertiges, dunkles xfwm4-Fensterrahmen-Theme mitbringt
-          # (Arc-Dark) - das kombiniert sich optisch stimmig mit Yaru.
-          #
-          # WARUM NICHT xfconf-query: Das Setzen von Themes zur Laufzeit
-          # braucht eine laufende D-Bus/XFCE-Session. Stattdessen schreiben
-          # wir die Konfigurationsdateien direkt VOR dem Start von XFCE -
-          # das ist deterministischer und vermeidet Race-Conditions.
-          sudo apt-get install -y \
-            yaru-theme-gtk \
-            yaru-theme-icon \
-            arc-theme \
-            fonts-ubuntu \
-            fonts-noto-color-emoji
+          # Settings-Pfad erstellen
+          mkdir -p ~/.config/autostart
 
-          mkdir -p ~/.config/xfce4/xfconf/xfce-perchannel-xml
-
-          # xsettings: GTK-Theme (Fensterinhalte, Buttons, Menüs) + Icons +
-          # Schriftart auf Yaru-Dark / Ubuntu-Font umstellen.
-          cat > ~/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml << 'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <channel name="xsettings" version="1.0">
-            <property name="Net" type="empty">
-              <property name="ThemeName" type="string" value="Yaru-dark"/>
-              <property name="IconThemeName" type="string" value="Yaru"/>
-            </property>
-            <property name="Gtk" type="empty">
-              <property name="FontName" type="string" value="Ubuntu 10"/>
-              <property name="CursorThemeName" type="string" value="Yaru"/>
-            </property>
-          </channel>
-          EOF
-
-          # xfwm4: Fensterrahmen/Titelleisten-Theme auf Arc-Dark (siehe
-          # Begruendung oben - kein offizielles Yaru-xfwm4-Paket auf Ubuntu
-          # verfuegbar). Arc-Dark ist ebenfalls ein flaches, dunkles Design
-          # und passt optisch gut zu den Yaru-GTK-Fensterinhalten.
-          cat > ~/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml << 'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <channel name="xfwm4" version="1.0">
-            <property name="general" type="empty">
-              <property name="theme" type="string" value="Arc-Dark"/>
-              <property name="title_font" type="string" value="Ubuntu Bold 9"/>
-              <property name="button_layout" type="string" value="O|HMC"/>
-            </property>
-          </channel>
-          EOF
-
-          # Desktop-Hintergrund: dezentes dunkles Blau-Grau statt XFCE-
-          # Standardmuster - ruhiger, moderner Look, keine Abhaengigkeit
-          # von einem Wallpaper-Bild-Paket.
-          cat > ~/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml << 'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <channel name="xfce4-desktop" version="1.0">
-            <property name="backdrop" type="empty">
-              <property name="screen0" type="empty">
-                <property name="monitor0" type="empty">
-                  <property name="workspace0" type="empty">
-                    <property name="color-style" type="int" value="0"/>
-                    <property name="image-style" type="int" value="0"/>
-                    <property name="rgba1" type="array">
-                      <value type="double" value="0.114"/>
-                      <value type="double" value="0.137"/>
-                      <value type="double" value="0.176"/>
-                      <value type="double" value="1.0"/>
-                    </property>
-                  </property>
-                </property>
-              </property>
-            </property>
-          </channel>
-          EOF
-
-          # Chrome-Startlink auf dem Desktop: startet maximiert und im
-          # systemweiten Dark Mode (passt zu Yaru-Dark), ohne die "Chrome
-          # wurde nicht richtig beendet"-Meldung.
+          # Chrome-Startlink auf dem Desktop einrichten
           mkdir -p ~/Desktop
           cat > ~/Desktop/google-chrome.desktop << 'EOF'
           [Desktop Entry]
@@ -152,35 +67,42 @@ jobs:
           EOF
           chmod +x ~/Desktop/google-chrome.desktop
 
-          echo "Yaru-Dark Theme + Chrome Dark-Mode-Launcher eingerichtet."
+          # Verknüpfung für GNOME Settings auf dem Desktop (für Online Accounts)
+          cat > ~/Desktop/gnome-control-center.desktop << 'EOF'
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=Settings
+          Comment=GNOME Settings (Online Accounts)
+          Exec=gnome-control-center
+          Icon=org.gnome.Settings
+          Terminal=false
+          Categories=Settings;
+          EOF
+          chmod +x ~/Desktop/gnome-control-center.desktop
 
       - name: Install Cloudflared
         run: |
           curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
 
-      - name: Start Display & Desktop Services
+      - name: Start Display & GNOME Desktop Services
         run: |
           # Virtuelles Display (1080p) starten
           Xvfb :99 -screen 0 1920x1080x24 &
           export DISPLAY=:99
           sleep 2
 
-          # XFCE Desktop-Umgebung starten (liest jetzt automatisch die
-          # zuvor geschriebenen Yaru-Dark-Konfigurationsdateien ein)
-          startxfce4 &
+          # D-Bus & GNOME Flashback Desktop-Umgebung starten
+          export $(dbus-launch)
+          gnome-session --session=gnome-flashback-metacity &
           sleep 5
 
-          # VNC-Server ohne Passwort starten (-nopw), nur auf localhost
-          # gebunden (-localhost) - erreichbar ausschließlich über den
-          # noVNC-Proxy, nicht direkt von außen.
+          # VNC-Server ohne Passwort (-nopw), gebunden an localhost
           x11vnc -nopw -localhost -rfbport 5900 -forever -shared -display :99 &
           sleep 2
 
-          # noVNC Web-Proxy starten (Port 6080) via websockify.
-          # (Das apt-Paket "novnc" liefert das Skript utils/novnc_proxy
-          # nicht zuverlässig mit - websockify ist der offiziell von
-          # Debian/Ubuntu dokumentierte, zuverlässige Weg.)
+          # noVNC Web-Proxy (Port 6080) via websockify
           websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
           sleep 2
 
@@ -197,22 +119,17 @@ jobs:
           sleep 5
 
           echo "=========================================="
-          echo "✅ Remote Desktop läuft und ist via Cloudflare Zero Trust erreichbar."
+          echo "✅ GNOME Remote Desktop läuft und ist via Cloudflare Zero Trust erreichbar."
           echo "   Rufe https://DEINE-SUBDOMAIN.DEINE-DOMAIN.com/vnc.html auf"
           echo "=========================================="
 
       - name: Keep Alive (mit Auto-Neustart vor Ablauf)
         run: |
-          # Phase 1: Großteil der Laufzeit "normal" offen halten.
           echo "Phase 1: 325 Minuten aktiv..."
           for i in $(seq 1 325); do
             sleep 60
           done
 
-          # Jetzt - noch mit ausreichend Puffer vor dem 350-Minuten-Timeout -
-          # den nächsten Lauf über die GitHub-API anstoßen. Er reiht sich
-          # dank "concurrency" hinten an und startet automatisch, sobald
-          # dieser Job hier endet.
           echo "Stoße nächsten Lauf an (Auto-Neustart)..."
           curl -s -X POST \
             -H "Accept: application/vnd.github+json" \
@@ -221,8 +138,6 @@ jobs:
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/remote-desktop.yml/dispatches" \
             -d "{\"ref\":\"${{ github.ref_name }}\"}"
 
-          # Phase 2: restlichen Puffer noch verbinden lassen, bis dieser
-          # Lauf sauber endet und der wartende Lauf übernehmen kann.
           echo "Phase 2: restliche 10 Minuten aktiv..."
           for i in $(seq 1 10); do
             sleep 60
