@@ -20,16 +20,135 @@ jobs:
     timeout-minutes: 350   # Hard-Limit von GitHub Actions liegt bei 360 Min.
 
     steps:
-      - name: Free Disk Space
+      # ------------------------------------------------------------------
+      # SCHNELLER START: WARP wird im Hintergrund vorbereitet, während der
+      # Desktop installiert wird. Beides läuft gleichzeitig.
+      # ------------------------------------------------------------------
+      - name: Fast start (tune apt, start WARP in background)
+        env:
+          WARP_ORGANIZATION: ${{ secrets.WARP_ORGANIZATION }}
+          WARP_AUTH_CLIENT_ID: ${{ secrets.WARP_AUTH_CLIENT_ID }}
+          WARP_AUTH_CLIENT_SECRET: ${{ secrets.WARP_AUTH_CLIENT_SECRET }}
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" /opt/hostedtoolcache /usr/local/lib/android || true
-          docker system prune -af --volumes || true
+          date +%s > /tmp/start-ts
 
-      - name: Install GNOME Flashback, Chrome, Online Accounts & Google Drive
+          if [ -z "$WARP_ORGANIZATION" ] || [ -z "$WARP_AUTH_CLIENT_ID" ] || [ -z "$WARP_AUTH_CLIENT_SECRET" ]; then
+            echo "❌ ERROR: One or more WARP secrets (WARP_ORGANIZATION, WARP_AUTH_CLIENT_ID, WARP_AUTH_CLIENT_SECRET) are missing!"
+            exit 1
+          fi
+
+          # apt schneller machen: keine man-Seiten-Datenbank neu bauen, kein fsync, keine Übersetzungen
+          echo "man-db man-db/auto-update boolean false" | sudo debconf-set-selections
+          sudo rm -f /var/lib/man-db/auto-update
+          echo 'force-unsafe-io' | sudo tee /etc/dpkg/dpkg.cfg.d/99-fast-io > /dev/null
+          echo 'Acquire::Languages "none";' | sudo tee /etc/apt/apt.conf.d/99-fast > /dev/null
+
+          # Plattenplatz freigeben: im Hintergrund mit niedriger Priorität (blockiert nichts)
+          sudo nohup ionice -c3 nice -n 19 rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" /usr/local/lib/android > /dev/null 2>&1 &
+
+          # WARP-Setup-Skript (läuft komplett im Hintergrund, parallel zur Desktop-Installation)
+          cat > ~/warp-setup.sh << 'WARPSCRIPT'
+          #!/bin/bash
+          exec > /tmp/warp-setup.log 2>&1
+          rm -f /tmp/warp.done /tmp/warp.failed /tmp/warp.connected
+          fail() { echo "❌ $*"; touch /tmp/warp.failed; exit 1; }
+
+          # 1. Ubuntu-Container für den offiziellen WARP-Client
+          docker run -d \
+            --name warp-proxy \
+            --privileged \
+            --cap-add NET_ADMIN \
+            -p 127.0.0.1:1080:1080 \
+            ubuntu:22.04 sleep infinity || fail "docker run failed"
+
+          # 2. Offizielles cloudflare-warp Paket installieren
+          docker exec warp-proxy bash -c "
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y curl gnupg lsb-release ca-certificates dbus socat
+            curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+            echo 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ jammy main' > /etc/apt/sources.list.d/cloudflare-client.list
+            apt-get update
+            apt-get install -y cloudflare-warp
+          " || fail "WARP install failed"
+
+          # 3. Zero-Trust-Anmeldung per Service Token über mdm.xml (Proxy-Modus auf Port 4000)
+          umask 077
+          cat > /tmp/mdm.xml << EOF
+          <dict>
+            <key>organization</key>
+            <string>${WARP_ORGANIZATION}</string>
+            <key>auth_client_id</key>
+            <string>${WARP_AUTH_CLIENT_ID}</string>
+            <key>auth_client_secret</key>
+            <string>${WARP_AUTH_CLIENT_SECRET}</string>
+            <key>service_mode</key>
+            <string>proxy</string>
+            <key>proxy_port</key>
+            <integer>4000</integer>
+            <key>auto_connect</key>
+            <integer>1</integer>
+            <key>onboarding</key>
+            <false/>
+          </dict>
+          EOF
+          docker exec warp-proxy mkdir -p /var/lib/cloudflare-warp
+          docker cp /tmp/mdm.xml warp-proxy:/var/lib/cloudflare-warp/mdm.xml
+          rm -f /tmp/mdm.xml
+
+          # 4. System-D-Bus und WARP-Dienst starten
+          docker exec warp-proxy bash -c "mkdir -p /run/dbus && rm -f /run/dbus/pid && dbus-daemon --config-file=/usr/share/dbus-1/system.conf --fork"
+          docker exec -d warp-proxy bash -c "warp-svc > /var/log/warp-svc.log 2>&1"
+
+          # 5. Auf Verbindung warten (max. ~90 Sekunden)
+          for i in $(seq 1 30); do
+            sleep 3
+            if docker exec warp-proxy warp-cli --accept-tos status 2>/dev/null | grep -q "Connected"; then
+              touch /tmp/warp.connected; break
+            fi
+            [ "$i" = "10" ] && docker exec warp-proxy warp-cli --accept-tos connect || true
+          done
+
+          # 6. Internen WARP-Proxy (4000) auf Container-Port 1080 weiterleiten
+          docker exec -d warp-proxy socat TCP-LISTEN:1080,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:4000
+          sleep 1
+
+          docker exec warp-proxy warp-cli --accept-tos status || true
+          if [ -f /tmp/warp.connected ]; then
+            echo "✅ WARP verbunden. Test über den Proxy:"
+            curl -s --max-time 15 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -E "warp=|gateway=" || echo "⚠️ Test fehlgeschlagen (evtl. Zertifikat passt nicht)"
+          else
+            echo "⚠️ WARP ist NICHT verbunden. Chrome lädt dann keine Seiten (kein Datenleck)."
+            docker exec warp-proxy tail -n 50 /var/log/warp-svc.log || true
+          fi
+          touch /tmp/warp.done
+          WARPSCRIPT
+          chmod +x ~/warp-setup.sh
+
+          nohup setsid bash ~/warp-setup.sh > /dev/null 2>&1 &
+          echo "WARP-Setup läuft im Hintergrund (Log: /tmp/warp-setup.log)"
+
+      - name: Install Desktop, Chrome, Terminal & Tools (one single apt run)
         run: |
           export DEBIAN_FRONTEND=noninteractive
+
+          # Chrome und cloudflared parallel herunterladen, während apt die Paketlisten lädt
+          mkdir -p /tmp/dl && chmod 755 /tmp/dl
+          curl -fsSL -o /tmp/dl/google-chrome-stable_current_amd64.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb &
+          P1=$!
+          curl -fsSL -o /tmp/dl/cloudflared-linux-amd64.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb &
+          P2=$!
           sudo apt-get update
+          wait $P1 || { echo "❌ Chrome-Download fehlgeschlagen"; exit 1; }
+          wait $P2 || { echo "❌ cloudflared-Download fehlgeschlagen"; exit 1; }
+          chmod 644 /tmp/dl/*.deb
+
+          # Alles in EINEM apt-Aufruf (ein einziger Lauf, Chrome + cloudflared direkt mit dabei).
+          # Schon vorhandene Standardprogramme (cp, mv, tar, gzip, curl, git ...) sind auf dem Runner vorinstalliert.
           sudo apt-get install -y \
+            /tmp/dl/google-chrome-stable_current_amd64.deb \
+            /tmp/dl/cloudflared-linux-amd64.deb \
             gnome-session-flashback \
             gnome-flashback \
             gnome-panel \
@@ -40,7 +159,6 @@ jobs:
             gvfs \
             gvfs-backends \
             nautilus \
-            gnome-terminal \
             adwaita-icon-theme \
             xvfb \
             x11-utils \
@@ -51,22 +169,7 @@ jobs:
             wget \
             dbus-x11 \
             libnss3-tools \
-            openssl
-
-          # Google Chrome installieren
-          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
-          rm -f google-chrome-stable_current_amd64.deb
-
-      - name: Install Terminal & Command-Line Tools
-        run: |
-          export DEBIAN_FRONTEND=noninteractive
-
-          # Terminal + comfort tools
-          # xfce4-terminal: small, fast, normal window size, tabs (Ctrl+Shift+T)
-          # mc: two-panel file manager in the terminal (like Total Commander)
-          # fzf / zoxide: fast search in history (Ctrl+R) and quick folder jumps (z <name>)
-          sudo apt-get install -y \
+            openssl \
             xfce4-terminal \
             xfconf \
             fonts-dejavu-core \
@@ -79,29 +182,13 @@ jobs:
             ncdu \
             python3 \
             python3-gi \
-            gir1.2-glib-2.0
-
-          # Standard tools: copy/move, archives (zip, unzip, 7z, rar via unar), editors, search, network
-          sudo apt-get install -y \
-            coreutils \
-            findutils \
-            grep \
-            sed \
-            gawk \
-            file \
-            less \
-            tar \
-            gzip \
-            bzip2 \
-            xz-utils \
-            zstd \
+            gir1.2-glib-2.0 \
             zip \
             unzip \
             p7zip-full \
-            unar \
+            libarchive-tools \
             rsync \
             nano \
-            vim \
             git \
             jq \
             ripgrep \
@@ -110,14 +197,8 @@ jobs:
             tmux \
             lsof \
             psmisc \
-            procps \
-            net-tools \
-            iputils-ping \
-            dnsutils \
-            traceroute \
-            aria2 \
-            pv \
             xclip
+          rm -rf /tmp/dl
 
           # Ubuntu names some tools differently: make "fd" and "bat" work as usual
           sudo ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true
@@ -128,9 +209,9 @@ jobs:
 
           # Check that the important commands really exist
           MISSING=""
-          for c in cp mv rm mkdir ls cat find grep sed awk tar gzip bzip2 xz zstd zip unzip 7z unar rsync \
-                   nano vim git jq rg fd bat curl wget less file tree htop ncdu mc fzf zoxide tmux \
-                   xfce4-terminal python3; do
+          for c in cp mv rm mkdir ls cat find grep sed awk tar gzip bzip2 xz zip unzip 7z bsdtar rsync \
+                   nano git jq rg fd bat curl wget less file tree htop ncdu mc fzf zoxide tmux \
+                   xfce4-terminal python3 google-chrome-stable cloudflared; do
             command -v "$c" >/dev/null || MISSING="$MISSING $c"
           done
           if [ -n "$MISSING" ]; then
@@ -599,88 +680,6 @@ jobs:
           rm -f "$CERT"
           echo "✅ Cloudflare Zero Trust Root CA installiert."
 
-      - name: Start Official Cloudflare WARP Zero Trust Proxy Container
-        env:
-          WARP_ORGANIZATION: ${{ secrets.WARP_ORGANIZATION }}
-          WARP_AUTH_CLIENT_ID: ${{ secrets.WARP_AUTH_CLIENT_ID }}
-          WARP_AUTH_CLIENT_SECRET: ${{ secrets.WARP_AUTH_CLIENT_SECRET }}
-        run: |
-          if [ -z "$WARP_ORGANIZATION" ] || [ -z "$WARP_AUTH_CLIENT_ID" ] || [ -z "$WARP_AUTH_CLIENT_SECRET" ]; then
-            echo "❌ ERROR: One or more WARP secrets (WARP_ORGANIZATION, WARP_AUTH_CLIENT_ID, WARP_AUTH_CLIENT_SECRET) are missing!"
-            exit 1
-          fi
-
-          # 1. Ubuntu-Container für den offiziellen WARP-Client
-          docker run -d \
-            --name warp-proxy \
-            --privileged \
-            --cap-add NET_ADMIN \
-            -p 127.0.0.1:1080:1080 \
-            ubuntu:22.04 sleep infinity
-
-          # 2. Offizielles cloudflare-warp Paket installieren
-          docker exec warp-proxy bash -c "
-            set -e
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            apt-get install -y curl gnupg lsb-release ca-certificates dbus socat
-            curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-            echo 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ jammy main' > /etc/apt/sources.list.d/cloudflare-client.list
-            apt-get update
-            apt-get install -y cloudflare-warp
-          "
-
-          # 3. Zero-Trust-Anmeldung per Service Token über mdm.xml (Proxy-Modus auf Port 4000)
-          umask 077
-          cat > /tmp/mdm.xml << EOF
-          <dict>
-            <key>organization</key>
-            <string>${WARP_ORGANIZATION}</string>
-            <key>auth_client_id</key>
-            <string>${WARP_AUTH_CLIENT_ID}</string>
-            <key>auth_client_secret</key>
-            <string>${WARP_AUTH_CLIENT_SECRET}</string>
-            <key>service_mode</key>
-            <string>proxy</string>
-            <key>proxy_port</key>
-            <integer>4000</integer>
-            <key>auto_connect</key>
-            <integer>1</integer>
-            <key>onboarding</key>
-            <false/>
-          </dict>
-          EOF
-          docker exec warp-proxy mkdir -p /var/lib/cloudflare-warp
-          docker cp /tmp/mdm.xml warp-proxy:/var/lib/cloudflare-warp/mdm.xml
-          rm -f /tmp/mdm.xml
-
-          # 4. System-D-Bus und WARP-Dienst starten
-          docker exec warp-proxy bash -c "mkdir -p /run/dbus && rm -f /run/dbus/pid && dbus-daemon --config-file=/usr/share/dbus-1/system.conf --fork"
-          docker exec -d warp-proxy bash -c "warp-svc > /var/log/warp-svc.log 2>&1"
-
-          # 5. Auf Verbindung warten (max. ~90 Sekunden)
-          CONNECTED=0
-          for i in $(seq 1 30); do
-            sleep 3
-            if docker exec warp-proxy warp-cli --accept-tos status 2>/dev/null | grep -q "Connected"; then
-              CONNECTED=1; break
-            fi
-            [ "$i" = "10" ] && docker exec warp-proxy warp-cli --accept-tos connect || true
-          done
-
-          # 6. Internen WARP-Proxy (4000) auf Container-Port 1080 weiterleiten
-          docker exec -d warp-proxy socat TCP-LISTEN:1080,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:4000
-          sleep 2
-
-          docker exec warp-proxy warp-cli --accept-tos status || true
-          if [ "$CONNECTED" = "1" ]; then
-            echo "✅ WARP verbunden. Test über den Proxy (mit installiertem Zertifikat):"
-            curl -s --max-time 15 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -E "warp=|gateway=" || echo "⚠️ Test fehlgeschlagen (evtl. Zertifikat passt nicht)"
-          else
-            echo "⚠️ WARP ist NICHT verbunden. Chrome lädt dann keine Seiten (kein Datenleck)."
-            docker exec warp-proxy tail -n 50 /var/log/warp-svc.log || true
-          fi
-
       - name: Configure Launchers & Desktop Session Script
         run: |
           mkdir -p ~/.config/autostart ~/Desktop ~/.local/share/applications ~/.config/xfce4/terminal ~/Downloads
@@ -788,7 +787,7 @@ jobs:
           alias free='free -h'
           alias drive='gdsh'
           # Unpack almost any archive: x file.zip / file.tar.gz / file.7z / file.rar
-          x() { [ -f "$1" ] || { echo "File not found: $1"; return 1; }; unar -f "$1"; }
+          x() { [ -f "$1" ] || { echo "File not found: $1"; return 1; }; bsdtar -xvf "$1"; }
           HISTSIZE=10000
           HISTFILESIZE=20000
           shopt -s histappend autocd cdspell 2>/dev/null
@@ -865,12 +864,6 @@ jobs:
           EOF
           chmod +x ~/desktop-session.sh
 
-      - name: Install Cloudflared
-        run: |
-          curl -fsSL --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.deb
-          rm -f cloudflared.deb
-
       - name: Start Display & GNOME Desktop Services
         run: |
           # 1. Virtuelles Display starten
@@ -883,15 +876,18 @@ jobs:
 
           # 2. Desktop-Sitzung mit Wächter starten (läuft unabhängig weiter)
           nohup setsid bash ~/desktop-session.sh > /tmp/desktop-session.log 2>&1 &
-          sleep 8
+          # Nicht stur 8 Sekunden warten, sondern nur bis das Panel da ist (max. 20 Sekunden)
+          for i in $(seq 1 20); do
+            pgrep -x gnome-panel >/dev/null && break
+            sleep 1
+          done
 
           # 3. VNC-Server ohne Passwort, nur lokal (Zugriff nur über Cloudflare Access)
           x11vnc -nopw -localhost -rfbport 5900 -forever -shared -display :99 -bg -o /tmp/x11vnc.log
-          sleep 2
 
           # 4. noVNC Web-Proxy (Port 6080, nur lokal)
           nohup websockify --web=/usr/share/novnc/ 127.0.0.1:6080 localhost:5900 > /tmp/websockify.log 2>&1 &
-          sleep 2
+          sleep 1
 
           echo "--- Desktop-Status ---"
           cat /tmp/desktop-session.log
@@ -909,12 +905,35 @@ jobs:
           fi
 
           nohup cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
-          sleep 5
+          # Warten, bis der Tunnel verbunden ist (max. 30 Sekunden)
+          for i in $(seq 1 30); do
+            grep -q "Registered tunnel connection" /tmp/cloudflared.log 2>/dev/null && break
+            sleep 1
+          done
 
           echo "=========================================="
           echo "✅ GNOME Remote Desktop läuft und ist via Cloudflare Zero Trust erreichbar."
           echo "   Rufe https://DEINE-SUBDOMAIN.DEINE-DOMAIN.com/vnc.html auf"
+          echo "   Desktop bereit nach $(( $(date +%s) - $(cat /tmp/start-ts) )) Sekunden."
           echo "=========================================="
+
+      - name: Wait for WARP (started in background at the beginning)
+        run: |
+          # WARP wurde schon ganz am Anfang parallel gestartet. Meist ist es jetzt fertig.
+          for i in $(seq 1 100); do
+            [ -f /tmp/warp.done ] && break
+            [ -f /tmp/warp.failed ] && break
+            sleep 3
+          done
+          echo "---------- WARP-Log ----------"
+          cat /tmp/warp-setup.log 2>/dev/null || true
+          echo "------------------------------"
+          if [ -f /tmp/warp.failed ]; then
+            echo "⚠️ WARP-Setup ist fehlgeschlagen. Chrome lädt dann keine Seiten (kein Datenleck)."
+          elif [ ! -f /tmp/warp.done ]; then
+            echo "⚠️ WARP war nach 5 Minuten noch nicht fertig. Log siehe oben."
+          fi
+          echo "Gesamtzeit bis hierher: $(( $(date +%s) - $(cat /tmp/start-ts) )) Sekunden."
 
       - name: Keep Alive (mit Auto-Neustart vor Ablauf)
         env:
