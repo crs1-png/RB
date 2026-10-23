@@ -61,6 +61,8 @@ jobs:
       - name: Install Terminal & Command-Line Tools
         run: |
           export DEBIAN_FRONTEND=noninteractive
+
+          # Terminal + comfort tools
           # xfce4-terminal: small, fast, normal window size, tabs (Ctrl+Shift+T)
           # mc: two-panel file manager in the terminal (like Total Commander)
           # fzf / zoxide: fast search in history (Ctrl+R) and quick folder jumps (z <name>)
@@ -75,11 +77,67 @@ jobs:
             tree \
             htop \
             ncdu \
+            python3 \
             python3-gi \
             gir1.2-glib-2.0
 
+          # Standard tools: copy/move, archives (zip, unzip, 7z, rar via unar), editors, search, network
+          sudo apt-get install -y \
+            coreutils \
+            findutils \
+            grep \
+            sed \
+            gawk \
+            file \
+            less \
+            tar \
+            gzip \
+            bzip2 \
+            xz-utils \
+            zstd \
+            zip \
+            unzip \
+            p7zip-full \
+            unar \
+            rsync \
+            nano \
+            vim \
+            git \
+            jq \
+            ripgrep \
+            fd-find \
+            bat \
+            tmux \
+            lsof \
+            psmisc \
+            procps \
+            net-tools \
+            iputils-ping \
+            dnsutils \
+            traceroute \
+            aria2 \
+            pv \
+            xclip
+
+          # Ubuntu names some tools differently: make "fd" and "bat" work as usual
+          sudo ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true
+          sudo ln -sf /usr/bin/batcat /usr/local/bin/bat 2>/dev/null || true
+
           # Make xfce4-terminal the default terminal
           sudo update-alternatives --set x-terminal-emulator /usr/bin/xfce4-terminal.wrapper || true
+
+          # Check that the important commands really exist
+          MISSING=""
+          for c in cp mv rm mkdir ls cat find grep sed awk tar gzip bzip2 xz zstd zip unzip 7z unar rsync \
+                   nano vim git jq rg fd bat curl wget less file tree htop ncdu mc fzf zoxide tmux \
+                   xfce4-terminal python3; do
+            command -v "$c" >/dev/null || MISSING="$MISSING $c"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "⚠️ Missing commands:$MISSING"
+          else
+            echo "✅ All standard commands are available"
+          fi
 
       - name: Install Google Drive Shell (gdsh)
         run: |
@@ -110,13 +168,19 @@ jobs:
               return name.replace("/", "_")
 
 
-          def find_drive_uri():
+          def find_drive_uris():
               try:
                   out = subprocess.run(["gio", "mount", "-li"], capture_output=True, text=True, timeout=30).stdout
               except Exception:
-                  return None
-              m = re.search(r"google-drive://[^\s]+", out)
-              return m.group(0) if m else None
+                  return []
+              uris = []
+              # Stop at whitespace, quotes and angle brackets (gio prints e.g. 'google-drive://user@host/')
+              for m in re.findall(r"google-drive://[^\s'\"<>]+", out):
+                  if not m.endswith("/"):
+                      m += "/"
+                  if m not in uris:
+                      uris.append(m)
+              return uris
 
 
           def ensure_mounted(uri):
@@ -357,7 +421,7 @@ jobs:
                   subprocess.run(["ls", "-lh", "--color=auto", "--group-directories-first"])
 
               def do_shell(self, arg):
-                  """!<command>         run a normal Linux command, e.g. !ls -la"""
+                  """!<command>         run a normal Linux command locally, e.g. !unzip file.zip"""
                   subprocess.run(arg, shell=True)
 
               def do_clear(self, arg):
@@ -433,17 +497,26 @@ jobs:
 
 
           def main():
-              uri = find_drive_uri()
-              if not uri:
+              uris = find_drive_uris()
+              if not uris:
                   print("No Google account found.")
                   print("Open 'Settings (Online Accounts)' on the desktop, add your Google account,")
                   print("make sure 'Files' is switched on, then run 'gdsh' again.")
                   return 1
+              uri = uris[0]
+              if len(uris) > 1:
+                  for n, u in enumerate(uris, 1):
+                      print(f"  {n}) {u}")
+                  choice = input("Which account? [1] ").strip() or "1"
+                  if choice.isdigit() and 1 <= int(choice) <= len(uris):
+                      uri = uris[int(choice) - 1]
               try:
                   root = ensure_mounted(uri)
               except GLib.Error as e:
                   print(f"Could not open Google Drive ({uri}): {e.message}")
+                  print("Tip: open the Google Drive once in 'Dateien (Google Drive)', then run gdsh again.")
                   return 1
+              print(f"Connected: {uri}")
               shell = DriveShell(root)
               while True:
                   try:
@@ -610,7 +683,7 @@ jobs:
 
       - name: Configure Launchers & Desktop Session Script
         run: |
-          mkdir -p ~/.config/autostart ~/Desktop ~/.local/share/applications ~/.config/xfce4/terminal
+          mkdir -p ~/.config/autostart ~/Desktop ~/.local/share/applications ~/.config/xfce4/terminal ~/Downloads
 
           # Chrome-Starter (geroutet über WARP SOCKS5 Proxy)
           cat > ~/Desktop/google-chrome.desktop << 'EOF'
@@ -698,14 +771,24 @@ jobs:
           cat >> ~/.bashrc << 'EOF'
 
           # ---- Terminal comfort ----
+          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+          export EDITOR=nano
+          export VISUAL=nano
           PS1='\[\e[1;32m\]\u\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
           alias ls='ls --color=auto --group-directories-first'
           alias ll='ls -alh'
+          alias la='ls -A'
           alias dir='ls -lh'
           alias cls='clear'
           alias ..='cd ..'
           alias ...='cd ../..'
+          alias grep='grep --color=auto'
+          alias df='df -h'
+          alias du='du -h'
+          alias free='free -h'
           alias drive='gdsh'
+          # Unpack almost any archive: x file.zip / file.tar.gz / file.7z / file.rar
+          x() { [ -f "$1" ] || { echo "File not found: $1"; return 1; }; unar -f "$1"; }
           HISTSIZE=10000
           HISTFILESIZE=20000
           shopt -s histappend autocd cdspell 2>/dev/null
