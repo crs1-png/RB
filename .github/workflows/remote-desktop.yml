@@ -30,6 +30,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             gnome-session-flashback \
+            metacity \
             gnome-control-center \
             gnome-online-accounts \
             nautilus \
@@ -150,21 +151,26 @@ jobs:
 
       - name: Start Display & GNOME Desktop Services
         run: |
-          # Virtuelles Display (1080p) starten
-          Xvfb :99 -screen 0 1920x1080x24 &
+          # 1. Virtuelles Display starten
+          Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset &
           export DISPLAY=:99
           sleep 2
 
-          # D-Bus & GNOME Flashback Desktop-Umgebung starten
-          export $(dbus-launch)
-          gnome-session --session=gnome-flashback-metacity &
+          # 2. D-Bus Instanz starten und Umgebungsvariablen exportieren
+          eval $(dbus-launch --sh-syntax)
+          export DBUS_SESSION_BUS_ADDRESS
+          export DBUS_SESSION_BUS_PID
+
+          # 3. GNOME Desktop & Metacity Window Manager im Hintergrund starten
+          metacity --replace &
+          gnome-session --session=gnome-flashback-metacity --disable-acceleration-check &
           sleep 5
 
-          # VNC-Server ohne Passwort (-nopw), gebunden an localhost
-          x11vnc -nopw -localhost -rfbport 5900 -forever -shared -display :99 &
+          # 4. VNC-Server ohne Passwort auf Display :99 starten
+          x11vnc -nopw -localhost -rfbport 5900 -forever -shared -display :99 -bg -o /tmp/x11vnc.log
           sleep 2
 
-          # noVNC Web-Proxy (Port 6080) via websockify
+          # 5. noVNC Web-Proxy (Port 6080) starten
           websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
           sleep 2
 
