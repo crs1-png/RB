@@ -50,12 +50,12 @@ jobs:
 
       - name: Install Cloudflare Root CA Certificate (TLS Decryption)
         run: |
-          # 1. Download Cloudflare Root Certificate
+          # 1. Cloudflare Root CA Zertifikat direkt von der API abrufen
           sudo mkdir -p /usr/local/share/ca-certificates/
-          sudo curl -fsSL "https://developers.cloudflare.com/cloudflare-one/static/documentation/connections/Cloudflare_CA.pem" -o /usr/local/share/ca-certificates/Cloudflare_CA.crt
+          sudo curl -fsSL "https://api.cloudflare.com/client/v4/certificates/curl" -o /usr/local/share/ca-certificates/Cloudflare_CA.crt
           sudo update-ca-certificates
 
-          # 2. Import into NSS database for Chrome trust
+          # 2. In die NSS-Datenbank für Chrome importieren
           mkdir -p ~/.pki/nssdb
           certutil -d sql:$HOME/.pki/nssdb -N --empty-password
           certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "Cloudflare Root CA" -i /usr/local/share/ca-certificates/Cloudflare_CA.crt
