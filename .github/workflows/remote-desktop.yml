@@ -2,27 +2,59 @@ name: Remote Desktop Runner (GNOME + Google Drive, Zero Trust, Auto-Restart)
 
 on:
   workflow_dispatch:
-  # Sicherheitsnetz: prüft alle 30 Minuten nach, ob die Auto-Neustart-Kette noch läuft.
+    inputs:
+      handover:
+        description: 'Internal: the new desktop prepares itself while the old one is still running (do not set by hand)'
+        required: false
+        default: 'false'
+  # Safety net: every 30 minutes. A cron run only starts a desktop if none is running (see Guard step).
   schedule:
     - cron: '*/30 * * * *'
 
-concurrency:
-  group: remote-desktop
-  cancel-in-progress: false
+# NOTE: there is intentionally NO "concurrency" block anymore.
+# With a concurrency group the next run stays "pending" until the old one has finished,
+# so the new desktop could only start building AFTER the old one ended (= minutes of waiting).
+# Now the next run starts while the old one is still active and waits just before the tunnel step.
 
 permissions:
-  actions: write   # nötig, damit der Job den nächsten Lauf selbst anstoßen darf
+  actions: write   # needed so the job can start the next run itself
   contents: read
 
 jobs:
   desktop:
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # Hard-Limit von GitHub Actions liegt bei 360 Min.
+    timeout-minutes: 350   # hard limit of GitHub Actions is 360 min
 
     steps:
       # ------------------------------------------------------------------
-      # SCHNELLER START: WARP wird im Hintergrund vorbereitet, während der
-      # Desktop installiert wird. Beides läuft gleichzeitig.
+      # Cron safety net: only start a new desktop if no other run is active.
+      # ------------------------------------------------------------------
+      - name: Guard (cron starts a desktop only if none is running)
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          WF_FILE=$(basename "${WORKFLOW_REF%@*}")
+          if gh api "repos/$REPO/actions/workflows/$WF_FILE/runs?per_page=50" > /tmp/runs.json 2> /tmp/runs.err; then
+            ACTIVE=$(jq --argjson id "$RUN_ID" '[.workflow_runs[] | select(.id != $id) | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="pending" or .status=="requested")] | length' /tmp/runs.json)
+          else
+            echo "⚠️ API-Abfrage fehlgeschlagen ($(cat /tmp/runs.err)) - starte sicherheitshalber."
+            ACTIVE=0
+          fi
+          ACTIVE=${ACTIVE:-0}
+          if [ "$ACTIVE" -gt 0 ]; then
+            echo "Es läuft bereits ein Desktop ($ACTIVE aktive Läufe). Dieser Cron-Lauf beendet sich wieder."
+            gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/cancel" > /dev/null || true
+            sleep 90
+            exit 1   # only reached if the cancel did not work: stop here, never start a second desktop
+          fi
+          echo "Kein Desktop aktiv - die Kette wird neu gestartet."
+
+      # ------------------------------------------------------------------
+      # FAST START: WARP is prepared in the background while the desktop installs.
       # ------------------------------------------------------------------
       - name: Fast start (tune apt, start WARP in background)
         env:
@@ -37,23 +69,28 @@ jobs:
             exit 1
           fi
 
-          # apt schneller machen: keine man-Seiten-Datenbank neu bauen, kein fsync, keine Übersetzungen
+          # make apt faster: no man-db rebuild, no fsync, no translations
           echo "man-db man-db/auto-update boolean false" | sudo debconf-set-selections
           sudo rm -f /var/lib/man-db/auto-update
           echo 'force-unsafe-io' | sudo tee /etc/dpkg/dpkg.cfg.d/99-fast-io > /dev/null
           echo 'Acquire::Languages "none";' | sudo tee /etc/apt/apt.conf.d/99-fast > /dev/null
 
-          # Plattenplatz freigeben: im Hintergrund mit niedriger Priorität (blockiert nichts)
-          sudo nohup ionice -c3 nice -n 19 rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" /usr/local/lib/android > /dev/null 2>&1 &
+          # Free disk space ONLY if it is really tight (the big delete costs disk I/O while apt is installing)
+          FREE_GB=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          echo "Freier Platz auf /: ${FREE_GB:-?} GB"
+          if [ "${FREE_GB:-0}" -lt 10 ]; then
+            echo "Wenig Platz - räume im Hintergrund auf."
+            sudo nohup rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" /usr/local/lib/android > /dev/null 2>&1 &
+          fi
 
-          # WARP-Setup-Skript (läuft komplett im Hintergrund, parallel zur Desktop-Installation)
+          # WARP setup script (runs completely in the background, parallel to the desktop installation)
           cat > ~/warp-setup.sh << 'WARPSCRIPT'
           #!/bin/bash
           exec > /tmp/warp-setup.log 2>&1
           rm -f /tmp/warp.done /tmp/warp.failed /tmp/warp.connected
           fail() { echo "❌ $*"; touch /tmp/warp.failed; exit 1; }
 
-          # 1. Ubuntu-Container für den offiziellen WARP-Client
+          # 1. Ubuntu container for the official WARP client
           docker run -d \
             --name warp-proxy \
             --privileged \
@@ -61,7 +98,7 @@ jobs:
             -p 127.0.0.1:1080:1080 \
             ubuntu:22.04 sleep infinity || fail "docker run failed"
 
-          # 2. Offizielles cloudflare-warp Paket installieren
+          # 2. Install the official cloudflare-warp package
           docker exec warp-proxy bash -c "
             set -e
             export DEBIAN_FRONTEND=noninteractive
@@ -73,7 +110,7 @@ jobs:
             apt-get install -y cloudflare-warp
           " || fail "WARP install failed"
 
-          # 3. Zero-Trust-Anmeldung per Service Token über mdm.xml (Proxy-Modus auf Port 4000)
+          # 3. Zero Trust login with service token via mdm.xml (proxy mode on port 4000)
           umask 077
           cat > /tmp/mdm.xml << EOF
           <dict>
@@ -97,20 +134,20 @@ jobs:
           docker cp /tmp/mdm.xml warp-proxy:/var/lib/cloudflare-warp/mdm.xml
           rm -f /tmp/mdm.xml
 
-          # 4. System-D-Bus und WARP-Dienst starten
+          # 4. Start system D-Bus and the WARP service
           docker exec warp-proxy bash -c "mkdir -p /run/dbus && rm -f /run/dbus/pid && dbus-daemon --config-file=/usr/share/dbus-1/system.conf --fork"
           docker exec -d warp-proxy bash -c "warp-svc > /var/log/warp-svc.log 2>&1"
 
-          # 5. Auf Verbindung warten (max. ~90 Sekunden)
-          for i in $(seq 1 30); do
-            sleep 3
+          # 5. Wait for the connection (max. ~90 seconds, checked every 2 s, explicit connect after ~10 s)
+          for i in $(seq 1 45); do
+            sleep 2
             if docker exec warp-proxy warp-cli --accept-tos status 2>/dev/null | grep -q "Connected"; then
               touch /tmp/warp.connected; break
             fi
-            [ "$i" = "10" ] && docker exec warp-proxy warp-cli --accept-tos connect || true
+            [ "$i" = "5" ] && docker exec warp-proxy warp-cli --accept-tos connect || true
           done
 
-          # 6. Internen WARP-Proxy (4000) auf Container-Port 1080 weiterleiten
+          # 6. Forward the internal WARP proxy (4000) to container port 1080
           docker exec -d warp-proxy socat TCP-LISTEN:1080,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:4000
           sleep 1
 
@@ -133,22 +170,29 @@ jobs:
         run: |
           export DEBIAN_FRONTEND=noninteractive
 
-          # Chrome und cloudflared parallel herunterladen, während apt die Paketlisten lädt
+          # Download .deb files in parallel while apt loads the package lists.
+          # Chrome is skipped if the runner image already has it (saves download + install time).
           mkdir -p /tmp/dl && chmod 755 /tmp/dl
-          curl -fsSL -o /tmp/dl/google-chrome-stable_current_amd64.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb &
-          P1=$!
+          DEBS=()
+          PIDS=()
           curl -fsSL -o /tmp/dl/cloudflared-linux-amd64.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb &
-          P2=$!
+          PIDS+=($!)
+          DEBS+=(/tmp/dl/cloudflared-linux-amd64.deb)
+          if [ -x /usr/bin/google-chrome-stable ]; then
+            echo "Chrome ist auf dem Runner schon vorinstalliert - Download entfällt."
+          else
+            curl -fsSL -o /tmp/dl/google-chrome-stable_current_amd64.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb &
+            PIDS+=($!)
+            DEBS+=(/tmp/dl/google-chrome-stable_current_amd64.deb)
+          fi
           sudo apt-get update
-          wait $P1 || { echo "❌ Chrome-Download fehlgeschlagen"; exit 1; }
-          wait $P2 || { echo "❌ cloudflared-Download fehlgeschlagen"; exit 1; }
+          for p in "${PIDS[@]}"; do
+            wait "$p" || { echo "❌ Download fehlgeschlagen"; exit 1; }
+          done
           chmod 644 /tmp/dl/*.deb
 
-          # Alles in EINEM apt-Aufruf (ein einziger Lauf, Chrome + cloudflared direkt mit dabei).
-          # Schon vorhandene Standardprogramme (cp, mv, tar, gzip, curl, git ...) sind auf dem Runner vorinstalliert.
-          sudo apt-get install -y \
-            /tmp/dl/google-chrome-stable_current_amd64.deb \
-            /tmp/dl/cloudflared-linux-amd64.deb \
+          # Everything in ONE apt call. Tools already on the runner (cp, mv, tar, gzip, curl, git ...) are skipped by apt.
+          sudo apt-get install -y "${DEBS[@]}" \
             gnome-session-flashback \
             gnome-flashback \
             gnome-panel \
@@ -219,6 +263,7 @@ jobs:
           else
             echo "✅ All standard commands are available"
           fi
+          echo "⏱ Installation fertig nach $(( $(date +%s) - $(cat /tmp/start-ts) )) Sekunden"
 
       - name: Install Google Drive Shell (gdsh)
         run: |
@@ -679,11 +724,11 @@ jobs:
 
       - name: Fix "Offline" in Online Accounts (disable NetworkManager)
         run: |
-          # NetworkManager verwaltet die Netzwerkkarte des Runners nicht und meldet fälschlich "offline"
+          # NetworkManager does not manage the runner's network card and wrongly reports "offline"
           sudo systemctl stop NetworkManager 2>/dev/null || true
           sudo systemctl mask NetworkManager 2>/dev/null || true
           sudo pkill -x NetworkManager 2>/dev/null || true
-          # Prüfen: Internet muss weiterhin funktionieren
+          # Check: internet must still work
           curl -s --max-time 10 -o /dev/null -w "Internet-Test: HTTP %{http_code}\n" https://www.google.com || echo "⚠️ Kein Internet"
 
       - name: Install Cloudflare Zero Trust Root CA (from Secret)
@@ -691,7 +736,7 @@ jobs:
           CF_CA_1: ${{ secrets.CLOUDFLARE_ROOT_CA_B64 }}
           CF_CA_2: ${{ secrets.CLOUDFLARE_CA_CERT }}
         run: |
-          # Akzeptiert beide Secret-Namen
+          # Accepts both secret names
           if [ -n "$CF_CA_1" ]; then
             CF_CA="$CF_CA_1"; echo "Verwende Secret CLOUDFLARE_ROOT_CA_B64"
           elif [ -n "$CF_CA_2" ]; then
@@ -708,10 +753,10 @@ jobs:
           rm -f "$CERT" "$RAW"
 
           if printf '%s' "$CF_CA" | grep -q "BEGIN CERTIFICATE"; then
-            # Secret enthält das Zertifikat als Text (PEM)
+            # Secret contains the certificate as text (PEM)
             printf '%s\n' "$CF_CA" | tr -d '\r' > "$CERT"
           else
-            # Secret enthält das Zertifikat Base64-kodiert (PEM- oder DER-Datei)
+            # Secret contains the certificate Base64-encoded (PEM or DER file)
             printf '%s' "$CF_CA" | tr -d '\r\n ' | base64 -d > "$RAW" 2>/dev/null || true
             if openssl x509 -in "$RAW" -noout 2>/dev/null; then
               openssl x509 -in "$RAW" -out "$CERT"
@@ -721,7 +766,7 @@ jobs:
             rm -f "$RAW"
           fi
 
-          # Prüfen, ob das Zertifikat gültig und nicht abgelaufen ist
+          # Check that the certificate is valid and not expired
           if ! openssl x509 -in "$CERT" -noout 2>/dev/null; then
             echo "❌ FEHLER: Der Inhalt des Secrets ist kein gültiges Zertifikat!"
             exit 1
@@ -730,11 +775,11 @@ jobs:
           openssl x509 -in "$CERT" -noout -subject -enddate -fingerprint -sha256
           openssl x509 -in "$CERT" -noout -checkend 0 || { echo "❌ Zertifikat ist abgelaufen"; exit 1; }
 
-          # 1. Systemweit vertrauen (curl, apt usw.)
+          # 1. Trust system-wide (curl, apt etc.)
           sudo cp "$CERT" /usr/local/share/ca-certificates/cloudflare-zt-root.crt
           sudo update-ca-certificates
 
-          # 2. Chrome vertrauen (NSS-Datenbank)
+          # 2. Trust in Chrome (NSS database)
           mkdir -p ~/.pki/nssdb
           [ -f ~/.pki/nssdb/cert9.db ] || certutil -d sql:$HOME/.pki/nssdb -N --empty-password
           certutil -d sql:$HOME/.pki/nssdb -D -n "Cloudflare Zero Trust Root CA" 2>/dev/null || true
@@ -747,7 +792,7 @@ jobs:
         run: |
           mkdir -p ~/.config/autostart ~/Desktop ~/.local/share/applications ~/.config/xfce4/terminal ~/Downloads
 
-          # Chrome-Starter (geroutet über WARP SOCKS5 Proxy)
+          # Chrome launcher (routed through the WARP SOCKS5 proxy)
           cat > ~/Desktop/google-chrome.desktop << 'EOF'
           [Desktop Entry]
           Version=1.0
@@ -773,7 +818,7 @@ jobs:
           Categories=Settings;
           EOF
 
-          # Dateimanager (Google Drive erscheint links nach Anmeldung)
+          # File manager (Google Drive appears on the left after login)
           cat > ~/Desktop/nautilus.desktop << 'EOF'
           [Desktop Entry]
           Version=1.0
@@ -860,8 +905,8 @@ jobs:
           command -v zoxide >/dev/null && eval "$(zoxide init bash)"
           EOF
 
-          # Desktop-Sitzung OHNE gnome-session (verhindert "Oh no! Something has gone wrong")
-          # Ein Wächter startet abgestürzte Teile automatisch neu.
+          # Desktop session WITHOUT gnome-session (prevents "Oh no! Something has gone wrong")
+          # A watchdog restarts crashed parts automatically.
           cat > ~/desktop-session.sh << 'EOF'
           #!/bin/bash
           export DISPLAY=:99
@@ -870,22 +915,22 @@ jobs:
           export XDG_SESSION_DESKTOP=gnome-flashback-metacity
           export DESKTOP_SESSION=gnome-flashback-metacity
           export NO_AT_BRIDGE=1
-          # Netzwerkstatus direkt prüfen statt über NetworkManager (behebt "Offline")
+          # Check network state directly instead of via NetworkManager (fixes "offline")
           export GIO_USE_NETWORK_MONITOR=netlink
           export XDG_RUNTIME_DIR="/tmp/runtime-$(id -u)"
           mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
 
-          # Eigene D-Bus-Sitzung
+          # Own D-Bus session
           eval "$(dbus-launch --sh-syntax)"
           export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
           dbus-update-activation-environment GIO_USE_NETWORK_MONITOR DISPLAY XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR 2>/dev/null || true
 
-          # Schlüsselbund mit leerem Passwort entsperren (für Online Accounts / Google Drive)
+          # Unlock keyring with empty password (for Online Accounts / Google Drive)
           echo -n "" | gnome-keyring-daemon --unlock --components=secrets,pkcs11 >/dev/null 2>&1 || true
           eval "$(gnome-keyring-daemon --start --components=secrets,pkcs11 2>/dev/null)" || true
           export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
 
-          # Dark Theme & Desktop-Symbole
+          # Dark theme & desktop icons
           gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark' || true
           gsettings set org.gnome.desktop.interface gtk-theme 'Adwaita-dark' || true
           gsettings set org.gnome.gnome-flashback desktop true || true
@@ -914,7 +959,7 @@ jobs:
             if ! pgrep -u "$(id -u)" -x "$name" >/dev/null; then
               echo "$(date '+%H:%M:%S') starte $name"
               "$@" >> "/tmp/desktop-$name.log" 2>&1 &
-              sleep 2
+              sleep 1
             fi
           }
 
@@ -927,36 +972,57 @@ jobs:
           EOF
           chmod +x ~/desktop-session.sh
 
-      - name: Start Display & GNOME Desktop Services
+      - name: Start Display, Desktop Session & VNC
         run: |
-          # 1. Virtuelles Display starten
+          # 1. Start the virtual display
           nohup Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
           for i in $(seq 1 20); do
             xdpyinfo -display :99 >/dev/null 2>&1 && break
-            sleep 1
+            sleep 0.5
           done
           xdpyinfo -display :99 >/dev/null 2>&1 || { echo "❌ Xvfb startet nicht"; cat /tmp/xvfb.log; exit 1; }
 
-          # 2. Desktop-Sitzung mit Wächter starten (läuft unabhängig weiter)
+          # 2. Start the desktop session with watchdog (keeps running on its own, we do NOT wait for it here)
           nohup setsid bash ~/desktop-session.sh > /tmp/desktop-session.log 2>&1 &
-          # Nicht stur 8 Sekunden warten, sondern nur bis das Panel da ist (max. 20 Sekunden)
-          for i in $(seq 1 20); do
-            pgrep -x gnome-panel >/dev/null && break
-            sleep 1
-          done
 
-          # 3. VNC-Server ohne Passwort, nur lokal (Zugriff nur über Cloudflare Access)
+          # 3. VNC server without password, local only (access only via Cloudflare Access)
           x11vnc -nopw -localhost -rfbport 5900 -forever -shared -display :99 -bg -o /tmp/x11vnc.log
 
-          # 4. noVNC Web-Proxy (Port 6080, nur lokal)
+          # 4. noVNC web proxy (port 6080, local only)
           nohup websockify --web=/usr/share/novnc/ 127.0.0.1:6080 localhost:5900 > /tmp/websockify.log 2>&1 &
           sleep 1
+          echo "⏱ Display + VNC laufen nach $(( $(date +%s) - $(cat /tmp/start-ts) )) Sekunden"
 
-          echo "--- Desktop-Status ---"
-          cat /tmp/desktop-session.log
-          pgrep -a -x metacity || echo "⚠️ metacity läuft nicht"
-          pgrep -a -x gnome-flashback || echo "⚠️ gnome-flashback läuft nicht"
-          pgrep -a -x gnome-panel || echo "⚠️ gnome-panel läuft nicht"
+      - name: Hand over (wait until the previous desktop has finished)
+        if: github.event.inputs.handover == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          # This desktop is fully prepared. It takes over the tunnel the moment the older run has ended.
+          WF_FILE=$(basename "${WORKFLOW_REF%@*}")
+          echo "Neuer Desktop ist vorbereitet ($(( $(date +%s) - $(cat /tmp/start-ts) )) s). Warte, bis der alte Desktop beendet ist ..."
+          FAIL=0
+          for i in $(seq 1 360); do   # 360 x 5 s = at most 30 minutes
+            if gh api "repos/$REPO/actions/workflows/$WF_FILE/runs?status=in_progress&per_page=100" > /tmp/old.json 2>/dev/null; then
+              FAIL=0
+              N=$(jq --argjson id "$RUN_ID" --argjson num "$RUN_NUMBER" '[.workflow_runs[] | select(.id != $id and .run_number < $num)] | length' /tmp/old.json)
+              if [ "${N:-1}" = "0" ]; then
+                echo "✅ Alter Desktop ist beendet - übernehme jetzt."
+                break
+              fi
+            else
+              FAIL=$((FAIL + 1))
+              if [ "$FAIL" -ge 5 ]; then
+                echo "⚠️ GitHub-API nicht erreichbar - übernehme trotzdem."
+                break
+              fi
+            fi
+            sleep 5
+          done
 
       - name: Start Cloudflare Tunnel
         env:
@@ -968,11 +1034,23 @@ jobs:
           fi
 
           nohup cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
-          # Warten, bis der Tunnel verbunden ist (max. 30 Sekunden)
-          for i in $(seq 1 30); do
+          # Wait until the tunnel is connected (max. 30 seconds)
+          for i in $(seq 1 60); do
             grep -q "Registered tunnel connection" /tmp/cloudflared.log 2>/dev/null && break
+            sleep 0.5
+          done
+
+          # Make sure the desktop panel is up (max. 20 seconds)
+          for i in $(seq 1 20); do
+            pgrep -x gnome-panel >/dev/null && break
             sleep 1
           done
+
+          echo "--- Desktop-Status ---"
+          cat /tmp/desktop-session.log
+          pgrep -a -x metacity || echo "⚠️ metacity läuft nicht"
+          pgrep -a -x gnome-flashback || echo "⚠️ gnome-flashback läuft nicht"
+          pgrep -a -x gnome-panel || echo "⚠️ gnome-panel läuft nicht"
 
           echo "=========================================="
           echo "✅ GNOME Remote Desktop läuft und ist via Cloudflare Zero Trust erreichbar."
@@ -982,7 +1060,7 @@ jobs:
 
       - name: Wait for WARP (started in background at the beginning)
         run: |
-          # WARP wurde schon ganz am Anfang parallel gestartet. Meist ist es jetzt fertig.
+          # WARP was started in parallel at the very beginning. Usually it is done by now.
           for i in $(seq 1 100); do
             [ -f /tmp/warp.done ] && break
             [ -f /tmp/warp.failed ] && break
@@ -998,7 +1076,7 @@ jobs:
           fi
           echo "Gesamtzeit bis hierher: $(( $(date +%s) - $(cat /tmp/start-ts) )) Sekunden."
 
-      - name: Keep Alive (mit Auto-Neustart vor Ablauf)
+      - name: Keep Alive (starts the next desktop early, then ends)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
@@ -1009,25 +1087,45 @@ jobs:
             pgrep -x cloudflared >/dev/null || echo "⚠️ cloudflared läuft nicht mehr"
           }
 
-          echo "Phase 1: 325 Minuten aktiv..."
-          for i in $(seq 1 325); do
-            sleep 60
-            [ $((i % 15)) -eq 0 ] && { echo "Minute $i"; health; }
+          # Timeline (counted from the start of this job):
+          #   minute 315: start the NEXT desktop (it builds itself and waits for the handover)
+          #   minute 335: this run ends, the next desktop takes over the tunnel within seconds
+          START=$(cat /tmp/start-ts)
+          HANDOVER_AT=$((START + 315 * 60))
+          END_AT=$((START + 335 * 60))
+
+          echo "Desktop aktiv. Der Nachfolger wird in $(( (HANDOVER_AT - $(date +%s)) / 60 )) Minuten gestartet."
+          N=0
+          while [ "$(date +%s)" -lt "$HANDOVER_AT" ]; do
+            sleep 30
+            N=$((N + 1))
+            if [ $((N % 30)) -eq 0 ]; then
+              echo "Minute $(( ($(date +%s) - START) / 60 ))"
+              health
+            fi
           done
 
-          # Dateiname des Workflows automatisch ermitteln
+          # Find the workflow file name automatically
           WF_FILE=$(basename "${WORKFLOW_REF%@*}")
-          echo "Stoße nächsten Lauf an (Auto-Neustart) für $WF_FILE ..."
-          curl -s -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$WF_FILE/dispatches" \
-            -d "{\"ref\":\"${{ github.ref_name }}\"}"
-
-          echo "Phase 2: restliche 10 Minuten aktiv..."
-          for i in $(seq 1 10); do
-            sleep 60
+          echo "Starte Nachfolger (Auto-Neustart) für $WF_FILE ..."
+          for TRY in 1 2 3 4 5; do
+            CODE=$(curl -s -o /tmp/dispatch.out -w '%{http_code}' -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$WF_FILE/dispatches" \
+              -d "{\"ref\":\"${{ github.ref_name }}\",\"inputs\":{\"handover\":\"true\"}}")
+            if [ "$CODE" = "204" ]; then
+              echo "✅ Nachfolger wurde gestartet."
+              break
+            fi
+            echo "⚠️ Start des Nachfolgers fehlgeschlagen (HTTP $CODE): $(cat /tmp/dispatch.out) - Versuch $TRY/5"
+            sleep 10
           done
 
-          echo "Dieser Lauf endet jetzt - der nachrückende Lauf übernimmt in Kürze."
+          echo "Dieser Desktop läuft noch $(( (END_AT - $(date +%s)) / 60 )) Minuten, dann übernimmt der neue."
+          while [ "$(date +%s)" -lt "$END_AT" ]; do
+            sleep 20
+          done
+
+          echo "Dieser Lauf endet jetzt - der nachrückende Lauf hat übernommen oder übernimmt in Kürze."
