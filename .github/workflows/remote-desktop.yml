@@ -228,6 +228,7 @@ jobs:
           #!/usr/bin/env python3
           """gdsh - Google Drive shell with real file names (account from GNOME Online Accounts)."""
           import cmd, glob, os, re, readline, subprocess, time
+          from concurrent.futures import ThreadPoolExecutor
           import gi
           gi.require_version("Gio", "2.0")
           from gi.repository import Gio, GLib
@@ -453,22 +454,84 @@ jobs:
                   self.cache.clear()
 
               def do_rm(self, arg):
-                  """rm <file|folder>   move to Google Drive trash (asks first)"""
+                  """rm [-rf] <file|folder>   delete a file or a whole folder (asks first, -f = no question)"""
+                  rest, force = arg.strip(), False
+                  while rest.startswith("-"):
+                      flag, _, rest = rest.partition(" ")
+                      rest = rest.strip()
+                      if flag == "--":
+                          break
+                      if "f" in flag[1:]:
+                          force = True
                   try:
-                      f, info = self._target(arg)
+                      f, info = self._target(rest)
                   except (GLib.Error, LookupError) as e:
                       return self._err(e)
-                  if input(f"Move '{info.get_display_name()}' to trash? [y/N] ").strip().lower() != "y":
-                      return print("Cancelled.")
+                  name, is_dir = info.get_display_name(), info.get_file_type() == DIR
+                  if not force:
+                      what = f"'{name}' and EVERYTHING inside it" if is_dir else f"'{name}'"
+                      if input(f"Delete {what}? [y/N] ").strip().lower() != "y":
+                          return print("Cancelled.")
                   try:
                       try:
                           f.trash(None)
+                          print("Moved to Google Drive trash.")
+                          return
                       except GLib.Error:
+                          pass  # trash not possible (e.g. folder with content) -> delete directly
+                      if not is_dir:
                           f.delete(None)
-                      print("Moved to trash.")
+                          print("Deleted.")
+                      else:
+                          self._delete_tree(f)
                   except GLib.Error as e:
                       self._err(e)
-                  self.cache.clear()
+                  finally:
+                      self.cache.clear()
+
+              def _delete_tree(self, root):
+                  files, dirs = [], []
+
+                  def collect(folder):
+                      dirs.append(folder)
+                      for child in self._list(folder, fresh=True):
+                          c = folder.get_child(child.get_name())
+                          if child.get_file_type() == DIR:
+                              collect(c)
+                          else:
+                              files.append(c)
+
+                  print("Counting files ...")
+                  collect(root)
+                  total = len(files)
+                  print(f"Deleting {total} files in {len(dirs)} folders (Ctrl+C stops) ...")
+
+                  def kill(item):
+                      for attempt in range(3):
+                          try:
+                              item.delete(None)
+                              return True
+                          except GLib.Error as e:
+                              if "not found" in (e.message or "").lower():
+                                  return True
+                              time.sleep(1 + attempt)
+                      return False
+
+                  failed = done = 0
+                  with ThreadPoolExecutor(max_workers=4) as pool:
+                      for ok in pool.map(kill, files):
+                          done += 1
+                          failed += 0 if ok else 1
+                          if done % 20 == 0 or done == total:
+                              print(f"\r  {done}/{total} files", end="", flush=True)
+                  print()
+                  for d in reversed(dirs):  # children first, top folder last
+                      if not kill(d):
+                          failed += 1
+                  if failed:
+                      print(f"Done, but {failed} item(s) could not be deleted. Run the same command again.")
+                  else:
+                      print("Deleted.")
 
               def do_cat(self, arg):
                   """cat <file>         show a text file"""
