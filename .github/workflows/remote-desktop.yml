@@ -58,24 +58,52 @@ jobs:
           sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
           rm -f google-chrome-stable_current_amd64.deb
 
-      - name: Install Cloudflare Root CA Certificate (TLS Decryption)
+      - name: Install Cloudflare Root CA Certificate (from Secret)
+        env:
+          CF_CA_CERT: ${{ secrets.CLOUDFLARE_CA_CERT }}
         run: |
           CERT=/tmp/Cloudflare_CA.crt
-          curl -fsSL "https://developers.cloudflare.com/cloudflare-one/static/Cloudflare_CA.pem" -o "$CERT" || true
+          rm -f "$CERT"
 
-          # Nur importieren, wenn wirklich ein gültiges Zertifikat geladen wurde
-          if openssl x509 -in "$CERT" -noout 2>/dev/null; then
-            sudo cp "$CERT" /usr/local/share/ca-certificates/Cloudflare_CA.crt
-            sudo update-ca-certificates
-
-            # In die NSS-Datenbank für Chrome importieren
-            mkdir -p ~/.pki/nssdb
-            [ -f ~/.pki/nssdb/cert9.db ] || certutil -d sql:$HOME/.pki/nssdb -N --empty-password
-            certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "Cloudflare Root CA" -i "$CERT"
-            echo "✅ Cloudflare Root CA installiert."
+          if [ -n "$CF_CA_CERT" ]; then
+            if printf '%s' "$CF_CA_CERT" | grep -q "BEGIN CERTIFICATE"; then
+              # Secret enthält das Zertifikat als Text (PEM)
+              printf '%s\n' "$CF_CA_CERT" | tr -d '\r' > "$CERT"
+            else
+              # Secret enthält das Zertifikat Base64-kodiert
+              printf '%s' "$CF_CA_CERT" | tr -d '\r\n ' | base64 -d > /tmp/cf_ca_raw 2>/dev/null || true
+              if openssl x509 -in /tmp/cf_ca_raw -noout 2>/dev/null; then
+                openssl x509 -in /tmp/cf_ca_raw -out "$CERT"
+              elif openssl x509 -inform DER -in /tmp/cf_ca_raw -noout 2>/dev/null; then
+                openssl x509 -inform DER -in /tmp/cf_ca_raw -out "$CERT"
+              fi
+              rm -f /tmp/cf_ca_raw
+            fi
           else
-            echo "⚠️ Cloudflare Root CA konnte nicht geladen werden – wird übersprungen."
+            echo "❌ FEHLER: Secret CLOUDFLARE_CA_CERT ist nicht gesetzt!"
+            exit 1
           fi
+
+          # Prüfen, ob das Zertifikat gültig ist
+          if ! openssl x509 -in "$CERT" -noout 2>/dev/null; then
+            echo "❌ FEHLER: Inhalt von CLOUDFLARE_CA_CERT ist kein gültiges Zertifikat!"
+            exit 1
+          fi
+
+          echo "Zertifikat:"
+          openssl x509 -in "$CERT" -noout -subject -enddate
+
+          # 1. In den System-Speicher (für curl, apt usw.)
+          sudo cp "$CERT" /usr/local/share/ca-certificates/Cloudflare_CA.crt
+          sudo update-ca-certificates
+
+          # 2. In die NSS-Datenbank für Chrome
+          mkdir -p ~/.pki/nssdb
+          [ -f ~/.pki/nssdb/cert9.db ] || certutil -d sql:$HOME/.pki/nssdb -N --empty-password
+          certutil -d sql:$HOME/.pki/nssdb -D -n "Cloudflare Root CA" 2>/dev/null || true
+          certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "Cloudflare Root CA" -i "$CERT"
+          certutil -d sql:$HOME/.pki/nssdb -L | grep "Cloudflare Root CA"
+          echo "✅ Cloudflare Root CA installiert."
 
       - name: Start Official Cloudflare WARP Zero Trust Proxy Container
         env:
@@ -152,8 +180,8 @@ jobs:
 
           docker exec warp-proxy warp-cli --accept-tos status || true
           if [ "$CONNECTED" = "1" ]; then
-            echo "✅ WARP verbunden. Test über den Proxy:"
-            curl -s --max-time 15 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -E "warp=|gateway=" || true
+            echo "✅ WARP verbunden. Test über den Proxy (mit installiertem Zertifikat):"
+            curl -s --max-time 15 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -E "warp=|gateway=" || echo "⚠️ Test fehlgeschlagen"
           else
             echo "⚠️ WARP ist NICHT verbunden. Chrome lädt dann keine Seiten (kein Datenleck)."
             docker exec warp-proxy tail -n 50 /var/log/warp-svc.log || true
@@ -309,8 +337,8 @@ jobs:
           WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
           health() {
-            pgrep -x Xvfb >/dev/null       || echo "⚠️ Xvfb läuft nicht mehr"
-            pgrep -x x11vnc >/dev/null     || echo "⚠️ x11vnc läuft nicht mehr"
+            pgrep -x Xvfb >/dev/null        || echo "⚠️ Xvfb läuft nicht mehr"
+            pgrep -x x11vnc >/dev/null      || echo "⚠️ x11vnc läuft nicht mehr"
             pgrep -x cloudflared >/dev/null || echo "⚠️ cloudflared läuft nicht mehr"
           }
 
