@@ -58,52 +58,71 @@ jobs:
           sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
           rm -f google-chrome-stable_current_amd64.deb
 
-      - name: Install Cloudflare Root CA Certificate (from Secret)
-        env:
-          CF_CA_CERT: ${{ secrets.CLOUDFLARE_CA_CERT }}
+      - name: Fix "Offline" in Online Accounts (disable NetworkManager)
         run: |
-          CERT=/tmp/Cloudflare_CA.crt
-          rm -f "$CERT"
+          # NetworkManager verwaltet die Netzwerkkarte des Runners nicht und meldet fälschlich "offline"
+          sudo systemctl stop NetworkManager 2>/dev/null || true
+          sudo systemctl mask NetworkManager 2>/dev/null || true
+          sudo pkill -x NetworkManager 2>/dev/null || true
+          # Prüfen: Internet muss weiterhin funktionieren
+          curl -s --max-time 10 -o /dev/null -w "Internet-Test: HTTP %{http_code}\n" https://www.google.com || echo "⚠️ Kein Internet"
 
-          if [ -n "$CF_CA_CERT" ]; then
-            if printf '%s' "$CF_CA_CERT" | grep -q "BEGIN CERTIFICATE"; then
-              # Secret enthält das Zertifikat als Text (PEM)
-              printf '%s\n' "$CF_CA_CERT" | tr -d '\r' > "$CERT"
-            else
-              # Secret enthält das Zertifikat Base64-kodiert
-              printf '%s' "$CF_CA_CERT" | tr -d '\r\n ' | base64 -d > /tmp/cf_ca_raw 2>/dev/null || true
-              if openssl x509 -in /tmp/cf_ca_raw -noout 2>/dev/null; then
-                openssl x509 -in /tmp/cf_ca_raw -out "$CERT"
-              elif openssl x509 -inform DER -in /tmp/cf_ca_raw -noout 2>/dev/null; then
-                openssl x509 -inform DER -in /tmp/cf_ca_raw -out "$CERT"
-              fi
-              rm -f /tmp/cf_ca_raw
-            fi
+      - name: Install Cloudflare Zero Trust Root CA (from Secret)
+        env:
+          CF_CA_1: ${{ secrets.CLOUDFLARE_ROOT_CA_B64 }}
+          CF_CA_2: ${{ secrets.CLOUDFLARE_CA_CERT }}
+        run: |
+          # Akzeptiert beide Secret-Namen
+          if [ -n "$CF_CA_1" ]; then
+            CF_CA="$CF_CA_1"; echo "Verwende Secret CLOUDFLARE_ROOT_CA_B64"
+          elif [ -n "$CF_CA_2" ]; then
+            CF_CA="$CF_CA_2"; echo "Verwende Secret CLOUDFLARE_CA_CERT"
           else
-            echo "❌ FEHLER: Secret CLOUDFLARE_CA_CERT ist nicht gesetzt!"
+            echo "❌ FEHLER: Kein Zertifikat-Secret gefunden!"
+            echo "   Lege unter Settings > Secrets and variables > Actions > Repository secrets"
+            echo "   ein Secret namens CLOUDFLARE_ROOT_CA_B64 oder CLOUDFLARE_CA_CERT an."
             exit 1
           fi
 
-          # Prüfen, ob das Zertifikat gültig ist
+          CERT="$RUNNER_TEMP/cf-zt-root.pem"
+          RAW="$RUNNER_TEMP/cf-zt-raw"
+          rm -f "$CERT" "$RAW"
+
+          if printf '%s' "$CF_CA" | grep -q "BEGIN CERTIFICATE"; then
+            # Secret enthält das Zertifikat als Text (PEM)
+            printf '%s\n' "$CF_CA" | tr -d '\r' > "$CERT"
+          else
+            # Secret enthält das Zertifikat Base64-kodiert (PEM- oder DER-Datei)
+            printf '%s' "$CF_CA" | tr -d '\r\n ' | base64 -d > "$RAW" 2>/dev/null || true
+            if openssl x509 -in "$RAW" -noout 2>/dev/null; then
+              openssl x509 -in "$RAW" -out "$CERT"
+            elif openssl x509 -inform DER -in "$RAW" -noout 2>/dev/null; then
+              openssl x509 -inform DER -in "$RAW" -out "$CERT"
+            fi
+            rm -f "$RAW"
+          fi
+
+          # Prüfen, ob das Zertifikat gültig und nicht abgelaufen ist
           if ! openssl x509 -in "$CERT" -noout 2>/dev/null; then
-            echo "❌ FEHLER: Inhalt von CLOUDFLARE_CA_CERT ist kein gültiges Zertifikat!"
+            echo "❌ FEHLER: Der Inhalt des Secrets ist kein gültiges Zertifikat!"
             exit 1
           fi
-
           echo "Zertifikat:"
-          openssl x509 -in "$CERT" -noout -subject -enddate
+          openssl x509 -in "$CERT" -noout -subject -enddate -fingerprint -sha256
+          openssl x509 -in "$CERT" -noout -checkend 0 || { echo "❌ Zertifikat ist abgelaufen"; exit 1; }
 
-          # 1. In den System-Speicher (für curl, apt usw.)
-          sudo cp "$CERT" /usr/local/share/ca-certificates/Cloudflare_CA.crt
+          # 1. Systemweit vertrauen (curl, apt usw.)
+          sudo cp "$CERT" /usr/local/share/ca-certificates/cloudflare-zt-root.crt
           sudo update-ca-certificates
 
-          # 2. In die NSS-Datenbank für Chrome
+          # 2. Chrome vertrauen (NSS-Datenbank)
           mkdir -p ~/.pki/nssdb
           [ -f ~/.pki/nssdb/cert9.db ] || certutil -d sql:$HOME/.pki/nssdb -N --empty-password
-          certutil -d sql:$HOME/.pki/nssdb -D -n "Cloudflare Root CA" 2>/dev/null || true
-          certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "Cloudflare Root CA" -i "$CERT"
-          certutil -d sql:$HOME/.pki/nssdb -L | grep "Cloudflare Root CA"
-          echo "✅ Cloudflare Root CA installiert."
+          certutil -d sql:$HOME/.pki/nssdb -D -n "Cloudflare Zero Trust Root CA" 2>/dev/null || true
+          certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "Cloudflare Zero Trust Root CA" -i "$CERT"
+          certutil -d sql:$HOME/.pki/nssdb -L | grep "Cloudflare Zero Trust Root CA"
+          rm -f "$CERT"
+          echo "✅ Cloudflare Zero Trust Root CA installiert."
 
       - name: Start Official Cloudflare WARP Zero Trust Proxy Container
         env:
@@ -181,7 +200,7 @@ jobs:
           docker exec warp-proxy warp-cli --accept-tos status || true
           if [ "$CONNECTED" = "1" ]; then
             echo "✅ WARP verbunden. Test über den Proxy (mit installiertem Zertifikat):"
-            curl -s --max-time 15 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -E "warp=|gateway=" || echo "⚠️ Test fehlgeschlagen"
+            curl -s --max-time 15 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -E "warp=|gateway=" || echo "⚠️ Test fehlgeschlagen (evtl. Zertifikat passt nicht)"
           else
             echo "⚠️ WARP ist NICHT verbunden. Chrome lädt dann keine Seiten (kein Datenleck)."
             docker exec warp-proxy tail -n 50 /var/log/warp-svc.log || true
@@ -211,7 +230,7 @@ jobs:
           Type=Application
           Name=Settings (Online Accounts)
           Comment=GNOME Settings – Google-Konto für Google Drive hinzufügen
-          Exec=env XDG_CURRENT_DESKTOP=GNOME gnome-control-center online-accounts
+          Exec=env GIO_USE_NETWORK_MONITOR=netlink XDG_CURRENT_DESKTOP=GNOME gnome-control-center online-accounts
           Icon=org.gnome.Settings
           Terminal=false
           Categories=Settings;
@@ -242,12 +261,15 @@ jobs:
           export XDG_SESSION_DESKTOP=gnome-flashback-metacity
           export DESKTOP_SESSION=gnome-flashback-metacity
           export NO_AT_BRIDGE=1
+          # Netzwerkstatus direkt prüfen statt über NetworkManager (behebt "Offline")
+          export GIO_USE_NETWORK_MONITOR=netlink
           export XDG_RUNTIME_DIR="/tmp/runtime-$(id -u)"
           mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
 
           # Eigene D-Bus-Sitzung
           eval "$(dbus-launch --sh-syntax)"
           export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
+          dbus-update-activation-environment GIO_USE_NETWORK_MONITOR DISPLAY XDG_CURRENT_DESKTOP 2>/dev/null || true
 
           # Schlüsselbund mit leerem Passwort entsperren (für Online Accounts / Google Drive)
           echo -n "" | gnome-keyring-daemon --unlock --components=secrets,pkcs11 >/dev/null 2>&1 || true
