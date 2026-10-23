@@ -40,34 +40,72 @@ jobs:
             websockify \
             curl \
             wget \
-            dbus-x11
+            dbus-x11 \
+            libnss3-tools
 
           # Google Chrome installieren
           wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
           rm google-chrome-stable_current_amd64.deb
 
+      - name: Install Cloudflare Root CA Certificate (TLS Decryption)
+        run: |
+          # 1. Download Cloudflare Root Certificate
+          sudo mkdir -p /usr/local/share/ca-certificates/
+          sudo curl -fsSL "https://developers.cloudflare.com/cloudflare-one/static/documentation/connections/Cloudflare_CA.pem" -o /usr/local/share/ca-certificates/Cloudflare_CA.crt
+          sudo update-ca-certificates
+
+          # 2. Import into NSS database for Chrome trust
+          mkdir -p ~/.pki/nssdb
+          certutil -d sql:$HOME/.pki/nssdb -N --empty-password
+          certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "Cloudflare Root CA" -i /usr/local/share/ca-certificates/Cloudflare_CA.crt
+
+      - name: Start Isolated WARP Zero Trust Proxy Container
+        env:
+          WARP_ORGANIZATION: ${{ secrets.WARP_ORGANIZATION }}
+          WARP_AUTH_CLIENT_ID: ${{ secrets.WARP_AUTH_CLIENT_ID }}
+          WARP_AUTH_CLIENT_SECRET: ${{ secrets.WARP_AUTH_CLIENT_SECRET }}
+        run: |
+          if [ -z "$WARP_ORGANIZATION" ] || [ -z "$WARP_AUTH_CLIENT_ID" ] || [ -z "$WARP_AUTH_CLIENT_SECRET" ]; then
+            echo "❌ ERROR: One or more WARP secrets (WARP_ORGANIZATION, WARP_AUTH_CLIENT_ID, WARP_AUTH_CLIENT_SECRET) are missing!"
+            exit 1
+          fi
+
+          # WARP Container mit SOCKS5 Proxy & Teams Authentifizierung starten
+          docker run -d \
+            --name warp-proxy \
+            --privileged \
+            --restart always \
+            -p 127.0.0.1:1080:1080 \
+            -e WARP_ORGANIZATION="$WARP_ORGANIZATION" \
+            -e WARP_AUTH_CLIENT_ID="$WARP_AUTH_CLIENT_ID" \
+            -e WARP_AUTH_CLIENT_SECRET="$WARP_AUTH_CLIENT_SECRET" \
+            cmulk/warp-socks5:latest
+
+          sleep 10
+          docker exec warp-proxy warp-cli --accept-tos status
+
       - name: Configure GNOME Dark Theme & Launchers
         run: |
           # Settings-Pfad erstellen
           mkdir -p ~/.config/autostart
 
-          # Chrome-Startlink auf dem Desktop einrichten
+          # Chrome-Startlink auf dem Desktop einrichten (geroutet über WARP SOCKS5 Proxy)
           mkdir -p ~/Desktop
           cat > ~/Desktop/google-chrome.desktop << 'EOF'
           [Desktop Entry]
           Version=1.0
           Type=Application
-          Name=Google Chrome
-          Comment=Web-Browser (Dark Mode)
-          Exec=/usr/bin/google-chrome-stable --force-dark-mode --enable-features=WebUIDarkMode --start-maximized --no-first-run --disable-session-crashed-bubble %U
+          Name=Google Chrome (WARP ZT)
+          Comment=Web-Browser via Cloudflare Zero Trust
+          Exec=/usr/bin/google-chrome-stable --proxy-server="socks5://127.0.0.1:1080" --force-dark-mode --enable-features=WebUIDarkMode --start-maximized --no-first-run --disable-session-crashed-bubble %U
           Icon=google-chrome
           Terminal=false
           Categories=Network;WebBrowser;
           EOF
           chmod +x ~/Desktop/google-chrome.desktop
 
-          # Verknüpfung für GNOME Settings auf dem Desktop (für Online Accounts)
+          # Verknüpfung für GNOME Settings auf dem Desktop
           cat > ~/Desktop/gnome-control-center.desktop << 'EOF'
           [Desktop Entry]
           Version=1.0
