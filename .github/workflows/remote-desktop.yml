@@ -58,6 +58,408 @@ jobs:
           sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
           rm -f google-chrome-stable_current_amd64.deb
 
+      - name: Install Terminal & Command-Line Tools
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          # xfce4-terminal: small, fast, normal window size, tabs (Ctrl+Shift+T)
+          # mc: two-panel file manager in the terminal (like Total Commander)
+          # fzf / zoxide: fast search in history (Ctrl+R) and quick folder jumps (z <name>)
+          sudo apt-get install -y \
+            xfce4-terminal \
+            xfconf \
+            fonts-dejavu-core \
+            bash-completion \
+            mc \
+            fzf \
+            zoxide \
+            tree \
+            htop \
+            ncdu \
+            python3-gi \
+            gir1.2-glib-2.0
+
+          # Make xfce4-terminal the default terminal
+          sudo update-alternatives --set x-terminal-emulator /usr/bin/xfce4-terminal.wrapper || true
+
+      - name: Install Google Drive Shell (gdsh)
+        run: |
+          # gdsh = terminal for Google Drive with REAL file names.
+          # Uses the Google account from GNOME Online Accounts. No extra OAuth app, no rclone, no API keys.
+          sudo tee /usr/local/bin/gdsh > /dev/null << 'EOF'
+          #!/usr/bin/env python3
+          """gdsh - Google Drive shell with real file names (account from GNOME Online Accounts)."""
+          import cmd, glob, os, re, readline, subprocess, time
+          import gi
+          gi.require_version("Gio", "2.0")
+          from gi.repository import Gio, GLib
+
+          ATTRS = "standard::name,standard::display-name,standard::type,standard::size"
+          BLUE, GREEN, OFF = "\033[1;34m", "\033[1;32m", "\033[0m"
+          DIR = Gio.FileType.DIRECTORY
+
+
+          def human(n):
+              for unit in ("B", "K", "M", "G", "T"):
+                  if n < 1024:
+                      return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+                  n /= 1024
+              return f"{n:.1f}P"
+
+
+          def safe(name):
+              return name.replace("/", "_")
+
+
+          def find_drive_uri():
+              try:
+                  out = subprocess.run(["gio", "mount", "-li"], capture_output=True, text=True, timeout=30).stdout
+              except Exception:
+                  return None
+              m = re.search(r"google-drive://[^\s]+", out)
+              return m.group(0) if m else None
+
+
+          def ensure_mounted(uri):
+              root = Gio.File.new_for_uri(uri)
+              try:
+                  root.query_info("standard::name", Gio.FileQueryInfoFlags.NONE, None)
+                  return root
+              except GLib.Error:
+                  pass
+              subprocess.run(["gio", "mount", uri], capture_output=True, timeout=90)
+              root.query_info("standard::name", Gio.FileQueryInfoFlags.NONE, None)
+              return root
+
+
+          class DriveShell(cmd.Cmd):
+              intro = "Google Drive shell - type 'help' for commands, 'exit' to quit."
+
+              def __init__(self, root):
+                  super().__init__()
+                  readline.set_completer_delims(" \t\n")
+                  self.stack = [(root, "")]
+                  self.cache = {}
+                  os.makedirs(os.path.expanduser("~/Downloads"), exist_ok=True)
+                  os.chdir(os.path.expanduser("~/Downloads"))
+                  self._prompt()
+
+              # ---------- helpers ----------
+              def _prompt(self):
+                  path = "/" + "/".join(n for _, n in self.stack[1:])
+                  self.prompt = f"\001{GREEN}\002drive:{path}\001{OFF}\002> "
+
+              def _arg(self, arg):
+                  arg = arg.strip()
+                  if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in "\"'":
+                      arg = arg[1:-1]
+                  return arg
+
+              def _err(self, e):
+                  print(f"Error: {e.message if isinstance(e, GLib.Error) else e}")
+
+              def _list(self, folder, fresh=False):
+                  key = folder.get_uri()
+                  hit = self.cache.get(key)
+                  if hit and not fresh and time.time() - hit[0] < 30:
+                      return hit[1]
+                  items = []
+                  en = folder.enumerate_children(ATTRS, Gio.FileQueryInfoFlags.NONE, None)
+                  while True:
+                      info = en.next_file(None)
+                      if info is None:
+                          break
+                      items.append(info)
+                  en.close(None)
+                  items.sort(key=lambda i: (i.get_file_type() != DIR, i.get_display_name().lower()))
+                  self.cache[key] = (time.time(), items)
+                  return items
+
+              def _find(self, folder, name):
+                  items = self._list(folder)
+                  for test in (lambda i: i.get_display_name() == name,
+                               lambda i: i.get_display_name().lower() == name.lower(),
+                               lambda i: i.get_name() == name):
+                      for info in items:
+                          if test(info):
+                              return info
+                  return None
+
+              def _walk(self, path):
+                  stack = self.stack[:1] if path.startswith("/") else list(self.stack)
+                  info = None
+                  for part in [p for p in path.split("/") if p and p != "."]:
+                      if part == "..":
+                          if len(stack) > 1:
+                              stack.pop()
+                          info = None
+                          continue
+                      info = self._find(stack[-1][0], part)
+                      if info is None:
+                          raise LookupError(f"Not found: {part}")
+                      stack.append((stack[-1][0].get_child(info.get_name()), info.get_display_name()))
+                  return stack, info
+
+              def _target(self, arg):
+                  stack, info = self._walk(self._arg(arg))
+                  if info is None:
+                      raise LookupError("Please give a file or folder name")
+                  return stack[-1][0], info
+
+              # ---------- Drive commands ----------
+              def do_ls(self, arg):
+                  """ls [folder]        list files with real names (also: dir, ll)"""
+                  try:
+                      stack, info = self._walk(self._arg(arg))
+                      if info and info.get_file_type() != DIR:
+                          return print(info.get_display_name())
+                      items = self._list(stack[-1][0], fresh=True)
+                  except (GLib.Error, LookupError) as e:
+                      return self._err(e)
+                  if not items:
+                      print("(empty)")
+                  for i in items:
+                      if i.get_file_type() == DIR:
+                          print(f"{'<DIR>':>9}  {BLUE}{i.get_display_name()}/{OFF}")
+                      else:
+                          print(f"{human(i.get_size()):>9}  {i.get_display_name()}")
+              do_dir = do_ll = do_ls
+
+              def do_cd(self, arg):
+                  """cd <folder>        change folder (cd .. = up, cd / = top, Tab completes)"""
+                  try:
+                      stack, info = self._walk(self._arg(arg) or "/")
+                  except (GLib.Error, LookupError) as e:
+                      return self._err(e)
+                  if info and info.get_file_type() != DIR:
+                      return print(f"Not a folder: {info.get_display_name()}")
+                  self.stack = stack
+                  self._prompt()
+
+              def do_pwd(self, arg):
+                  """pwd                show current Drive folder"""
+                  print("/" + "/".join(n for _, n in self.stack[1:]))
+
+              def do_get(self, arg):
+                  """get <file|folder>  download into the current local folder (see lpwd, lcd)"""
+                  try:
+                      src, info = self._target(arg)
+                      dest = os.path.join(os.getcwd(), safe(info.get_display_name()))
+                      self._download(src, info, dest)
+                      print(f"Done -> {dest}")
+                  except (GLib.Error, LookupError, OSError) as e:
+                      self._err(e)
+
+              def _download(self, src, info, dest):
+                  if info.get_file_type() == DIR:
+                      os.makedirs(dest, exist_ok=True)
+                      for child in self._list(src):
+                          self._download(src.get_child(child.get_name()), child,
+                                         os.path.join(dest, safe(child.get_display_name())))
+                      return
+                  try:
+                      src.copy(Gio.File.new_for_path(dest), Gio.FileCopyFlags.OVERWRITE, None, None)
+                      print(f"  {info.get_display_name()}")
+                  except GLib.Error as e:
+                      print(f"  skipped {info.get_display_name()} ({e.message})")
+
+              def do_put(self, arg):
+                  """put <local path>   upload a local file or folder into the current Drive folder"""
+                  local = os.path.expanduser(self._arg(arg))
+                  if not local or not os.path.exists(local):
+                      return print(f"Not found locally: {local}")
+                  try:
+                      self._upload(os.path.abspath(local), self.stack[-1][0])
+                      print("Done.")
+                  except (GLib.Error, LookupError) as e:
+                      self._err(e)
+                  self.cache.clear()
+
+              def _upload(self, local, folder):
+                  name = os.path.basename(os.path.normpath(local))
+                  existing = self._find(folder, name)
+                  if os.path.isdir(local):
+                      if not (existing and existing.get_file_type() == DIR):
+                          folder.get_child_for_display_name(name).make_directory(None)
+                          self.cache.pop(folder.get_uri(), None)
+                          existing = self._find(folder, name)
+                          if existing is None:
+                              raise LookupError(f"Could not create folder: {name}")
+                      target = folder.get_child(existing.get_name())
+                      for entry in sorted(os.listdir(local)):
+                          self._upload(os.path.join(local, entry), target)
+                      return
+                  if existing:
+                      dest, flags = folder.get_child(existing.get_name()), Gio.FileCopyFlags.OVERWRITE
+                  else:
+                      dest, flags = folder.get_child_for_display_name(name), Gio.FileCopyFlags.NONE
+                  Gio.File.new_for_path(local).copy(dest, flags, None, None)
+                  print(f"  {name}")
+
+              def do_mkdir(self, arg):
+                  """mkdir <name>       create a folder in the current Drive folder"""
+                  name = self._arg(arg)
+                  if not name:
+                      return print("Please give a folder name")
+                  try:
+                      self.stack[-1][0].get_child_for_display_name(name).make_directory(None)
+                      print(f"Created: {name}")
+                  except GLib.Error as e:
+                      self._err(e)
+                  self.cache.clear()
+
+              def do_rm(self, arg):
+                  """rm <file|folder>   move to Google Drive trash (asks first)"""
+                  try:
+                      f, info = self._target(arg)
+                  except (GLib.Error, LookupError) as e:
+                      return self._err(e)
+                  if input(f"Move '{info.get_display_name()}' to trash? [y/N] ").strip().lower() != "y":
+                      return print("Cancelled.")
+                  try:
+                      try:
+                          f.trash(None)
+                      except GLib.Error:
+                          f.delete(None)
+                      print("Moved to trash.")
+                  except GLib.Error as e:
+                      self._err(e)
+                  self.cache.clear()
+
+              def do_cat(self, arg):
+                  """cat <file>         show a text file"""
+                  try:
+                      f, info = self._target(arg)
+                      ok, data, _ = f.load_contents(None)
+                      print(data[:200000].decode("utf-8", errors="replace"))
+                  except (GLib.Error, LookupError) as e:
+                      self._err(e)
+
+              def do_refresh(self, arg):
+                  """refresh            reload file lists from Google Drive"""
+                  self.cache.clear()
+                  print("Cache cleared.")
+
+              # ---------- local commands ----------
+              def do_lpwd(self, arg):
+                  """lpwd               show the local folder (downloads go here)"""
+                  print(os.getcwd())
+
+              def do_lcd(self, arg):
+                  """lcd <path>         change the local folder"""
+                  try:
+                      os.chdir(os.path.expanduser(self._arg(arg) or "~"))
+                      print(os.getcwd())
+                  except OSError as e:
+                      self._err(e)
+
+              def do_lls(self, arg):
+                  """lls                list the local folder"""
+                  subprocess.run(["ls", "-lh", "--color=auto", "--group-directories-first"])
+
+              def do_shell(self, arg):
+                  """!<command>         run a normal Linux command, e.g. !ls -la"""
+                  subprocess.run(arg, shell=True)
+
+              def do_clear(self, arg):
+                  """clear              clear the screen (also: cls)"""
+                  os.system("clear")
+              do_cls = do_clear
+
+              def do_exit(self, arg):
+                  """exit               leave gdsh"""
+                  return True
+              do_quit = do_exit
+
+              def do_EOF(self, arg):
+                  print()
+                  return True
+
+              def do_help(self, arg):
+                  if arg:
+                      return super().do_help(arg)
+                  print("\nCommands:")
+                  for name in ("ls", "cd", "pwd", "get", "put", "mkdir", "rm", "cat", "refresh",
+                               "lpwd", "lcd", "lls", "shell", "clear", "exit"):
+                      print("  " + getattr(self, "do_" + name).__doc__)
+                  print("\nNames with spaces work without quotes. Tab completes names.\n")
+
+              def emptyline(self):
+                  pass
+
+              # ---------- tab completion ----------
+              def _complete_remote(self, text, line, dirs_only=False):
+                  arg = line.split(" ", 1)[1] if " " in line else ""
+                  base, sep, partial = arg.rpartition("/")
+                  try:
+                      stack = self._walk(base + sep)[0] if sep else self.stack
+                      items = self._list(stack[-1][0])
+                  except Exception:
+                      return []
+                  out = []
+                  for i in items:
+                      is_dir = i.get_file_type() == DIR
+                      if dirs_only and not is_dir:
+                          continue
+                      name = i.get_display_name() + ("/" if is_dir else "")
+                      if name.lower().startswith(partial.lower()):
+                          out.append((base + sep + name)[len(arg) - len(text):])
+                  return out
+
+              def _complete_local(self, text, line, dirs_only=False):
+                  arg = line.split(" ", 1)[1] if " " in line else ""
+                  home = os.path.expanduser("~")
+                  out = []
+                  for p in glob.glob(os.path.expanduser(arg) + "*"):
+                      if dirs_only and not os.path.isdir(p):
+                          continue
+                      p += "/" if os.path.isdir(p) else ""
+                      if arg.startswith("~"):
+                          p = "~" + p[len(home):]
+                      out.append(p[len(arg) - len(text):])
+                  return out
+
+              def complete_cd(self, text, line, b, e):
+                  return self._complete_remote(text, line, dirs_only=True)
+
+              def complete_ls(self, text, line, b, e):
+                  return self._complete_remote(text, line)
+              complete_dir = complete_ll = complete_get = complete_rm = complete_cat = complete_ls
+
+              def complete_put(self, text, line, b, e):
+                  return self._complete_local(text, line)
+
+              def complete_lcd(self, text, line, b, e):
+                  return self._complete_local(text, line, dirs_only=True)
+
+
+          def main():
+              uri = find_drive_uri()
+              if not uri:
+                  print("No Google account found.")
+                  print("Open 'Settings (Online Accounts)' on the desktop, add your Google account,")
+                  print("make sure 'Files' is switched on, then run 'gdsh' again.")
+                  return 1
+              try:
+                  root = ensure_mounted(uri)
+              except GLib.Error as e:
+                  print(f"Could not open Google Drive ({uri}): {e.message}")
+                  return 1
+              shell = DriveShell(root)
+              while True:
+                  try:
+                      shell.cmdloop()
+                      return 0
+                  except KeyboardInterrupt:
+                      print("^C")
+                      shell.intro = None
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          EOF
+          sudo chmod +x /usr/local/bin/gdsh
+          python3 -m py_compile /usr/local/bin/gdsh && echo "✅ gdsh installed"
+
       - name: Fix "Offline" in Online Accounts (disable NetworkManager)
         run: |
           # NetworkManager verwaltet die Netzwerkkarte des Runners nicht und meldet fälschlich "offline"
@@ -208,7 +610,7 @@ jobs:
 
       - name: Configure Launchers & Desktop Session Script
         run: |
-          mkdir -p ~/.config/autostart ~/Desktop ~/.local/share/applications
+          mkdir -p ~/.config/autostart ~/Desktop ~/.local/share/applications ~/.config/xfce4/terminal
 
           # Chrome-Starter (geroutet über WARP SOCKS5 Proxy)
           cat > ~/Desktop/google-chrome.desktop << 'EOF'
@@ -248,8 +650,70 @@ jobs:
           Categories=Utility;
           EOF
 
+          # Normal terminal (compact window, no menu bar)
+          cat > ~/Desktop/terminal.desktop << 'EOF'
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=Terminal
+          Comment=Linux terminal
+          Exec=xfce4-terminal --geometry=110x30 --hide-menubar --hide-toolbar
+          Icon=utilities-terminal
+          Terminal=false
+          Categories=System;TerminalEmulator;
+          EOF
+
+          # Google Drive terminal (opens gdsh, after "exit" you are back in a normal shell)
+          cat > ~/Desktop/gdrive-terminal.desktop << 'EOF'
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=Google Drive Terminal
+          Comment=Navigate Google Drive with real file names
+          Exec=xfce4-terminal --geometry=110x30 --hide-menubar --hide-toolbar --title="Google Drive" -x bash -c "gdsh; exec bash"
+          Icon=folder-remote
+          Terminal=false
+          Categories=System;Utility;
+          EOF
+
           chmod +x ~/Desktop/*.desktop
           cp ~/Desktop/*.desktop ~/.local/share/applications/
+
+          # Terminal look (fallback for older xfce4-terminal versions; newer ones are set via xfconf in the session script)
+          cat > ~/.config/xfce4/terminal/terminalrc << 'EOF'
+          [Configuration]
+          FontName=DejaVu Sans Mono 11
+          FontUseSystem=FALSE
+          MiscDefaultGeometry=110x30
+          MiscMenubarDefault=FALSE
+          MiscToolbarDefault=FALSE
+          MiscConfirmClose=FALSE
+          ScrollingUnlimited=TRUE
+          ColorForeground=#e6e6e6
+          ColorBackground=#1e1e1e
+          ColorCursor=#e6e6e6
+          EOF
+
+          # Comfortable bash: short colored prompt, CMD-like aliases, fast search and folder jumps
+          cat >> ~/.bashrc << 'EOF'
+
+          # ---- Terminal comfort ----
+          PS1='\[\e[1;32m\]\u\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
+          alias ls='ls --color=auto --group-directories-first'
+          alias ll='ls -alh'
+          alias dir='ls -lh'
+          alias cls='clear'
+          alias ..='cd ..'
+          alias ...='cd ../..'
+          alias drive='gdsh'
+          HISTSIZE=10000
+          HISTFILESIZE=20000
+          shopt -s histappend autocd cdspell 2>/dev/null
+          bind 'set completion-ignore-case on' 2>/dev/null
+          [ -f /usr/share/bash-completion/bash_completion ] && . /usr/share/bash-completion/bash_completion
+          [ -f /usr/share/doc/fzf/examples/key-bindings.bash ] && . /usr/share/doc/fzf/examples/key-bindings.bash
+          command -v zoxide >/dev/null && eval "$(zoxide init bash)"
+          EOF
 
           # Desktop-Sitzung OHNE gnome-session (verhindert "Oh no! Something has gone wrong")
           # Ein Wächter startet abgestürzte Teile automatisch neu.
@@ -269,7 +733,7 @@ jobs:
           # Eigene D-Bus-Sitzung
           eval "$(dbus-launch --sh-syntax)"
           export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
-          dbus-update-activation-environment GIO_USE_NETWORK_MONITOR DISPLAY XDG_CURRENT_DESKTOP 2>/dev/null || true
+          dbus-update-activation-environment GIO_USE_NETWORK_MONITOR DISPLAY XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR 2>/dev/null || true
 
           # Schlüsselbund mit leerem Passwort entsperren (für Online Accounts / Google Drive)
           echo -n "" | gnome-keyring-daemon --unlock --components=secrets,pkcs11 >/dev/null 2>&1 || true
@@ -282,7 +746,23 @@ jobs:
           gsettings set org.gnome.gnome-flashback desktop true || true
           gsettings set org.gnome.desktop.screensaver lock-enabled false || true
           gsettings set org.gnome.desktop.session idle-delay 0 || true
+          gsettings set org.gnome.desktop.default-applications.terminal exec 'xfce4-terminal' 2>/dev/null || true
           for f in "$HOME"/Desktop/*.desktop; do gio set "$f" metadata::trusted true 2>/dev/null || true; done
+
+          # Terminal look (xfce4-terminal 1.x stores settings in xfconf)
+          if command -v xfconf-query >/dev/null; then
+            xt() { xfconf-query -c xfce4-terminal -p "$1" -n -t "$2" -s "$3" 2>/dev/null || true; }
+            xt /font-name string "DejaVu Sans Mono 11"
+            xt /font-use-system bool false
+            xt /misc-default-geometry string "110x30"
+            xt /misc-menubar-default bool false
+            xt /misc-toolbar-default bool false
+            xt /misc-confirm-close bool false
+            xt /scrolling-unlimited bool true
+            xt /color-foreground string "#e6e6e6"
+            xt /color-background string "#1e1e1e"
+            xt /color-cursor string "#e6e6e6"
+          fi
 
           start_if_missing() {
             local name="$1"; shift
