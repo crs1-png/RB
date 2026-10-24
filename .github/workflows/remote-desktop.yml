@@ -11,7 +11,7 @@ on:
   schedule:
     - cron: '*/30 * * * *'
 
-# NOTE: there is intentionally NO "concurrency" block anymore.
+# NOTE: there is intentionally NO "concurrency" block.
 # With a concurrency group the next run stays "pending" until the old one has finished,
 # so the new desktop could only start building AFTER the old one ended (= minutes of waiting).
 # Now the next run starts while the old one is still active and waits just before the tunnel step.
@@ -192,6 +192,7 @@ jobs:
           chmod 644 /tmp/dl/*.deb
 
           # Everything in ONE apt call. Tools already on the runner (cp, mv, tar, gzip, curl, git ...) are skipped by apt.
+          # NEW: tigervnc-standalone-server (fast display + VNC in one process). Xvfb + x11vnc stay installed as fallback.
           sudo apt-get install -y "${DEBS[@]}" \
             gnome-session-flashback \
             gnome-flashback \
@@ -204,6 +205,9 @@ jobs:
             gvfs-backends \
             nautilus \
             adwaita-icon-theme \
+            tigervnc-standalone-server \
+            tigervnc-common \
+            xfonts-base \
             xvfb \
             x11-utils \
             x11vnc \
@@ -251,11 +255,15 @@ jobs:
           # Make xfce4-terminal the default terminal
           sudo update-alternatives --set x-terminal-emulator /usr/bin/xfce4-terminal.wrapper || true
 
+          # noVNC: opening the plain address already uses the fast settings (auto connect, remote resize, quality 6, compression 4)
+          sudo rm -f /usr/share/novnc/index.html
+          echo '<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=vnc.html?autoconnect=true&resize=remote&quality=6&compression=4"></head><body></body></html>' | sudo tee /usr/share/novnc/index.html > /dev/null
+
           # Check that the important commands really exist
           MISSING=""
           for c in cp mv rm mkdir ls cat find grep sed awk tar gzip bzip2 xz zip unzip 7z bsdtar rsync \
                    nano git jq rg fd bat curl wget less file tree htop ncdu mc fzf zoxide tmux \
-                   xfce4-terminal python3 google-chrome-stable cloudflared; do
+                   xfce4-terminal python3 google-chrome-stable cloudflared Xtigervnc Xvfb x11vnc; do
             command -v "$c" >/dev/null || MISSING="$MISSING $c"
           done
           if [ -n "$MISSING" ]; then
@@ -792,14 +800,14 @@ jobs:
         run: |
           mkdir -p ~/.config/autostart ~/Desktop ~/.local/share/applications ~/.config/xfce4/terminal ~/Downloads
 
-          # Chrome launcher (routed through the WARP SOCKS5 proxy)
+          # Chrome launcher (routed through the WARP SOCKS5 proxy, smooth-scrolling off for less lag over VNC)
           cat > ~/Desktop/google-chrome.desktop << 'EOF'
           [Desktop Entry]
           Version=1.0
           Type=Application
           Name=Google Chrome (WARP ZT)
           Comment=Web-Browser via Cloudflare Zero Trust
-          Exec=/usr/bin/google-chrome-stable --proxy-server="socks5://127.0.0.1:1080" --force-dark-mode --enable-features=WebUIDarkMode --start-maximized --no-first-run --no-default-browser-check --disable-session-crashed-bubble --disable-dev-shm-usage --password-store=basic %U
+          Exec=/usr/bin/google-chrome-stable --proxy-server="socks5://127.0.0.1:1080" --force-dark-mode --enable-features=WebUIDarkMode --start-maximized --no-first-run --no-default-browser-check --disable-session-crashed-bubble --disable-dev-shm-usage --password-store=basic --disable-smooth-scrolling --disable-gpu-vsync --disable-features=SmoothScrolling %U
           Icon=google-chrome
           Terminal=false
           Categories=Network;WebBrowser;
@@ -937,6 +945,11 @@ jobs:
           gsettings set org.gnome.desktop.screensaver lock-enabled false || true
           gsettings set org.gnome.desktop.session idle-delay 0 || true
           gsettings set org.gnome.desktop.default-applications.terminal exec 'xfce4-terminal' 2>/dev/null || true
+
+          # PERFORMANCE: no animations, no compositing (much smoother over VNC)
+          gsettings set org.gnome.desktop.interface enable-animations false || true
+          gsettings set org.gnome.metacity compositing-manager false 2>/dev/null || true
+
           for f in "$HOME"/Desktop/*.desktop; do gio set "$f" metadata::trusted true 2>/dev/null || true; done
 
           # Terminal look (xfce4-terminal 1.x stores settings in xfconf)
@@ -974,24 +987,52 @@ jobs:
 
       - name: Start Display, Desktop Session & VNC
         run: |
-          # 1. Start the virtual display
-          nohup Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
-          for i in $(seq 1 20); do
-            xdpyinfo -display :99 >/dev/null 2>&1 && break
-            sleep 0.5
-          done
-          xdpyinfo -display :99 >/dev/null 2>&1 || { echo "❌ Xvfb startet nicht"; cat /tmp/xvfb.log; exit 1; }
+          # 1. Virtual display + VNC server.
+          #    Preferred: TigerVNC (display and VNC in ONE process = faster, better compression, supports remote resize).
+          #    Fallback: Xvfb + x11vnc (the old way) if TigerVNC does not start.
+          VNC_OK=0
+          if command -v Xtigervnc >/dev/null; then
+            nohup Xtigervnc :99 -geometry 1600x900 -depth 24 \
+              -rfbport 5900 -SecurityTypes None -localhost \
+              -AlwaysShared -ac -FrameRate 60 > /tmp/xvnc.log 2>&1 &
+            for i in $(seq 1 20); do
+              xdpyinfo -display :99 >/dev/null 2>&1 && { VNC_OK=1; break; }
+              sleep 0.5
+            done
+            if [ "$VNC_OK" != "1" ]; then
+              echo "⚠️ Xtigervnc startet nicht - wechsle auf Xvfb + x11vnc. Log:"
+              cat /tmp/xvnc.log
+              pkill -x Xtigervnc 2>/dev/null || true
+              sleep 1
+            fi
+          fi
+
+          if [ "$VNC_OK" = "1" ]; then
+            echo "tigervnc" > /tmp/vnc-mode
+            echo "✅ TigerVNC läuft (1600x900)."
+          else
+            nohup Xvfb :99 -screen 0 1600x900x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
+            for i in $(seq 1 20); do
+              xdpyinfo -display :99 >/dev/null 2>&1 && break
+              sleep 0.5
+            done
+            xdpyinfo -display :99 >/dev/null 2>&1 || { echo "❌ Xvfb startet nicht"; cat /tmp/xvfb.log; exit 1; }
+            echo "xvfb" > /tmp/vnc-mode
+          fi
 
           # 2. Start the desktop session with watchdog (keeps running on its own, we do NOT wait for it here)
           nohup setsid bash ~/desktop-session.sh > /tmp/desktop-session.log 2>&1 &
 
-          # 3. VNC server without password, local only (access only via Cloudflare Access)
-          x11vnc -nopw -localhost -rfbport 5900 -forever -shared -display :99 -bg -o /tmp/x11vnc.log
+          # 3. Only for the fallback: separate VNC server (without password, local only, shorter wait times = smoother)
+          if [ "$(cat /tmp/vnc-mode)" = "xvfb" ]; then
+            x11vnc -nopw -localhost -rfbport 5900 -forever -shared -display :99 -wait 5 -defer 5 -bg -o /tmp/x11vnc.log
+            echo "✅ Fallback x11vnc läuft."
+          fi
 
           # 4. noVNC web proxy (port 6080, local only)
           nohup websockify --web=/usr/share/novnc/ 127.0.0.1:6080 localhost:5900 > /tmp/websockify.log 2>&1 &
           sleep 1
-          echo "⏱ Display + VNC laufen nach $(( $(date +%s) - $(cat /tmp/start-ts) )) Sekunden"
+          echo "⏱ Display + VNC laufen nach $(( $(date +%s) - $(cat /tmp/start-ts) )) Sekunden (Modus: $(cat /tmp/vnc-mode))"
 
       - name: Hand over (wait until the previous desktop has finished)
         if: github.event.inputs.handover == 'true'
@@ -1054,7 +1095,9 @@ jobs:
 
           echo "=========================================="
           echo "✅ GNOME Remote Desktop läuft und ist via Cloudflare Zero Trust erreichbar."
-          echo "   Rufe https://DEINE-SUBDOMAIN.DEINE-DOMAIN.com/vnc.html auf"
+          echo "   Rufe https://DEINE-SUBDOMAIN.DEINE-DOMAIN.com/ auf (nutzt automatisch die schnellen Einstellungen)"
+          echo "   oder direkt: https://DEINE-SUBDOMAIN.DEINE-DOMAIN.com/vnc.html?autoconnect=true&resize=remote&quality=6&compression=4"
+          echo "   VNC-Modus: $(cat /tmp/vnc-mode)"
           echo "   Desktop bereit nach $(( $(date +%s) - $(cat /tmp/start-ts) )) Sekunden."
           echo "=========================================="
 
@@ -1082,8 +1125,12 @@ jobs:
           WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
           health() {
-            pgrep -x Xvfb >/dev/null        || echo "⚠️ Xvfb läuft nicht mehr"
-            pgrep -x x11vnc >/dev/null      || echo "⚠️ x11vnc läuft nicht mehr"
+            if [ "$(cat /tmp/vnc-mode 2>/dev/null)" = "tigervnc" ]; then
+              pgrep -x Xtigervnc >/dev/null || echo "⚠️ Xtigervnc läuft nicht mehr"
+            else
+              pgrep -x Xvfb >/dev/null   || echo "⚠️ Xvfb läuft nicht mehr"
+              pgrep -x x11vnc >/dev/null || echo "⚠️ x11vnc läuft nicht mehr"
+            fi
             pgrep -x cloudflared >/dev/null || echo "⚠️ cloudflared läuft nicht mehr"
           }
 
