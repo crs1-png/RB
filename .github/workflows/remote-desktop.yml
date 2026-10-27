@@ -1,5 +1,6 @@
 name: Remote Desktop Runner (GNOME + Google Drive, Zero Trust, Auto-Restart)
 
+
 on:
   workflow_dispatch:
     inputs:
@@ -11,18 +12,23 @@ on:
   schedule:
     - cron: '*/30 * * * *'
 
+
 # NOTE: there is intentionally NO "concurrency" block.
 # With a concurrency group the next run stays "pending" until the old one has finished,
 # so the new desktop could only start building AFTER the old one ended (= minutes of waiting).
 # Now the next run starts while the old one is still active and waits just before the tunnel step.
 
+
 permissions:
   actions: write   # needed so the job can start the next run itself
   contents: read
 
+
 jobs:
   desktop:
-    runs-on: ubuntu-latest
+    # More CPU = the biggest lever for smoothness. If you have a larger runner, set the
+    # repository variable RUNNER_LABEL (Settings > Secrets and variables > Actions > Variables).
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     timeout-minutes: 350   # hard limit of GitHub Actions is 360 min
 
     steps:
@@ -41,22 +47,22 @@ jobs:
           if gh api "repos/$REPO/actions/workflows/$WF_FILE/runs?per_page=50" > /tmp/runs.json 2> /tmp/runs.err; then
             ACTIVE=$(jq --argjson id "$RUN_ID" '[.workflow_runs[] | select(.id != $id) | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="pending" or .status=="requested")] | length' /tmp/runs.json)
           else
-            echo "⚠️ API-Abfrage fehlgeschlagen ($(cat /tmp/runs.err)) - starte sicherheitshalber."
+            echo "⚠️ API request failed ($(cat /tmp/runs.err)) - starting anyway to be safe."
             ACTIVE=0
           fi
           ACTIVE=${ACTIVE:-0}
           if [ "$ACTIVE" -gt 0 ]; then
-            echo "Es läuft bereits ein Desktop ($ACTIVE aktive Läufe). Dieser Cron-Lauf beendet sich wieder."
+            echo "A desktop is already running ($ACTIVE active runs). This cron run stops itself."
             gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/cancel" > /dev/null || true
             sleep 90
             exit 1   # only reached if the cancel did not work: stop here, never start a second desktop
           fi
-          echo "Kein Desktop aktiv - die Kette wird neu gestartet."
+          echo "No desktop active - restarting the chain."
 
       # ------------------------------------------------------------------
       # FAST START: WARP is prepared in the background while the desktop installs.
       # ------------------------------------------------------------------
-      - name: Fast start (tune apt, start WARP in background)
+      - name: Fast start (tune apt, free CPU, start WARP in background)
         env:
           WARP_ORGANIZATION: ${{ secrets.WARP_ORGANIZATION }}
           WARP_AUTH_CLIENT_ID: ${{ secrets.WARP_AUTH_CLIENT_ID }}
@@ -75,11 +81,17 @@ jobs:
           echo 'force-unsafe-io' | sudo tee /etc/dpkg/dpkg.cfg.d/99-fast-io > /dev/null
           echo 'Acquire::Languages "none";' | sudo tee /etc/apt/apt.conf.d/99-fast > /dev/null
 
+          # SMOOTHNESS: stop background services that randomly eat CPU during the session
+          for s in unattended-upgrades apt-daily.timer apt-daily-upgrade.timer man-db.timer \
+                   packagekit fwupd snapd.service snapd.socket; do
+            sudo systemctl stop "$s" > /dev/null 2>&1 || true
+          done
+
           # Free disk space ONLY if it is really tight (the big delete costs disk I/O while apt is installing)
           FREE_GB=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
-          echo "Freier Platz auf /: ${FREE_GB:-?} GB"
+          echo "Free space on /: ${FREE_GB:-?} GB"
           if [ "${FREE_GB:-0}" -lt 10 ]; then
-            echo "Wenig Platz - räume im Hintergrund auf."
+            echo "Low disk space - cleaning up in the background."
             sudo nohup rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" /usr/local/lib/android > /dev/null 2>&1 &
           fi
 
@@ -153,10 +165,10 @@ jobs:
 
           docker exec warp-proxy warp-cli --accept-tos status || true
           if [ -f /tmp/warp.connected ]; then
-            echo "✅ WARP verbunden. Test über den Proxy:"
-            curl -s --max-time 15 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -E "warp=|gateway=" || echo "⚠️ Test fehlgeschlagen (evtl. Zertifikat passt nicht)"
+            echo "✅ WARP connected. Test through the proxy:"
+            curl -s --max-time 15 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -E "warp=|gateway=" || echo "⚠️ Test failed (certificate may not match)"
           else
-            echo "⚠️ WARP ist NICHT verbunden. Chrome lädt dann keine Seiten (kein Datenleck)."
+            echo "⚠️ WARP is NOT connected. Chrome will not load pages (no data leak)."
             docker exec warp-proxy tail -n 50 /var/log/warp-svc.log || true
           fi
           touch /tmp/warp.done
@@ -164,7 +176,7 @@ jobs:
           chmod +x ~/warp-setup.sh
 
           nohup setsid bash ~/warp-setup.sh > /dev/null 2>&1 &
-          echo "WARP-Setup läuft im Hintergrund (Log: /tmp/warp-setup.log)"
+          echo "WARP setup runs in the background (log: /tmp/warp-setup.log)"
 
       - name: Install Desktop, Chrome, Terminal & Tools (one single apt run)
         run: |
@@ -179,7 +191,7 @@ jobs:
           PIDS+=($!)
           DEBS+=(/tmp/dl/cloudflared-linux-amd64.deb)
           if [ -x /usr/bin/google-chrome-stable ]; then
-            echo "Chrome ist auf dem Runner schon vorinstalliert - Download entfällt."
+            echo "Chrome is already installed on the runner - skipping download."
           else
             curl -fsSL -o /tmp/dl/google-chrome-stable_current_amd64.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb &
             PIDS+=($!)
@@ -187,16 +199,17 @@ jobs:
           fi
           sudo apt-get update
           for p in "${PIDS[@]}"; do
-            wait "$p" || { echo "❌ Download fehlgeschlagen"; exit 1; }
+            wait "$p" || { echo "❌ Download failed"; exit 1; }
           done
           chmod 644 /tmp/dl/*.deb
 
-          # Everything in ONE apt call. Tools already on the runner (cp, mv, tar, gzip, curl, git ...) are skipped by apt.
-          # NEW: tigervnc-standalone-server (fast display + VNC in one process). Xvfb + x11vnc stay installed as fallback.
+          # Everything in ONE apt call. Tools already on the runner are skipped by apt.
+          # NEW: gnome-settings-daemon (provides gsd-xsettings = sharp fonts + scaling for all apps), zenity (scale dialog)
           sudo apt-get install -y "${DEBS[@]}" \
             gnome-session-flashback \
             gnome-flashback \
             gnome-panel \
+            gnome-settings-daemon \
             metacity \
             gnome-control-center \
             gnome-online-accounts \
@@ -210,9 +223,11 @@ jobs:
             xfonts-base \
             xvfb \
             x11-utils \
+            x11-xserver-utils \
             x11vnc \
             novnc \
             websockify \
+            zenity \
             curl \
             wget \
             dbus-x11 \
@@ -221,6 +236,7 @@ jobs:
             xfce4-terminal \
             xfconf \
             fonts-dejavu-core \
+            fonts-noto-core \
             bash-completion \
             mc \
             fzf \
@@ -255,14 +271,75 @@ jobs:
           # Make xfce4-terminal the default terminal
           sudo update-alternatives --set x-terminal-emulator /usr/bin/xfce4-terminal.wrapper || true
 
-          # noVNC: opening the plain address already uses the fast settings (auto connect, remote resize, quality 6, compression 4)
+          # ------------------------------------------------------------------
+          # SHARPNESS: noVNC start page
+          #  - quality=9   -> highest JPEG quality, no colour subsampling (no blurry/colour-fringed text)
+          #  - compression=2 -> less CPU on the server = smoother
+          #  - reconnect   -> reconnects by itself after short network hiccups and after the handover
+          #  - The page checks the browser pixel ratio. With Windows scaling 125 %/150 % or a Retina
+          #    display the browser stretches the picture = blurry. The page asks the user ONCE to zoom
+          #    out (Ctrl + Minus) until the picture is 1:1. The browser remembers the zoom for this site.
+          # ------------------------------------------------------------------
           sudo rm -f /usr/share/novnc/index.html
-          echo '<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=vnc.html?autoconnect=true&resize=remote&quality=6&compression=4"></head><body></body></html>' | sudo tee /usr/share/novnc/index.html > /dev/null
+          sudo tee /usr/share/novnc/index.html > /dev/null << 'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Remote Desktop</title>
+          <style>
+            html, body { margin: 0; height: 100%; background: #1e1e1e; color: #e6e6e6; font-family: system-ui, sans-serif; }
+            #box { max-width: 520px; margin: 12vh auto; padding: 28px; background: #2a2a2a; border-radius: 12px; line-height: 1.5; }
+            h1 { font-size: 22px; margin: 0 0 12px; }
+            kbd { background: #444; border-radius: 4px; padding: 2px 6px; }
+            .big { font-size: 28px; font-weight: 600; color: #8ab4f8; }
+            a { color: #8ab4f8; }
+            #box[hidden] { display: none; }
+          </style>
+          </head>
+          <body>
+          <div id="box" hidden>
+            <h1>One-time setup for a sharp picture</h1>
+            <p>Your screen uses scaling, so the browser would stretch the remote desktop and it would look blurry.</p>
+            <p>Press <kbd>Ctrl</kbd> + <kbd>-</kbd> (Mac: <kbd>Cmd</kbd> + <kbd>-</kbd>) until the zoom is at</p>
+            <p class="big" id="target"></p>
+            <p>The desktop then opens automatically. Your browser remembers this setting for this site.</p>
+            <p>Text too small afterwards? On the remote desktop open <b>Display scale</b> and choose a larger value.</p>
+            <p><a href="#" id="skip">Continue without sharp mode</a></p>
+          </div>
+          <script>
+            (function () {
+              var url = 'vnc.html?autoconnect=true&resize=remote&quality=9&compression=2' +
+                        '&reconnect=true&reconnect_delay=1500&show_dot=true&logging=warn';
+              var box = document.getElementById('box');
+              var target = document.getElementById('target');
+              var zoomPresets = [25, 33, 50, 67, 75, 80, 90, 100];
+              var go = function () { window.location.replace(url); };
+              var sharp = function () { return Math.abs(window.devicePixelRatio - 1) < 0.03; };
+              var check = function () {
+                if (sharp()) { go(); return; }
+                // devicePixelRatio = OS scaling x browser zoom. Suggest the browser zoom that brings it to 1.
+                var osScale = window.devicePixelRatio;
+                var best = zoomPresets.reduce(function (a, b) {
+                  return Math.abs(100 / osScale - b) < Math.abs(100 / osScale - a) ? b : a;
+                });
+                target.textContent = 'about ' + best + ' % (smaller than now)';
+                box.hidden = false;
+              };
+              document.getElementById('skip').addEventListener('click', function (e) { e.preventDefault(); go(); });
+              window.addEventListener('resize', check);
+              check();
+            })();
+          </script>
+          </body>
+          </html>
+          EOF
 
           # Check that the important commands really exist
           MISSING=""
           for c in cp mv rm mkdir ls cat find grep sed awk tar gzip bzip2 xz zip unzip 7z bsdtar rsync \
-                   nano git jq rg fd bat curl wget less file tree htop ncdu mc fzf zoxide tmux \
+                   nano git jq rg fd bat curl wget less file tree htop ncdu mc fzf zoxide tmux zenity \
                    xfce4-terminal python3 google-chrome-stable cloudflared Xtigervnc Xvfb x11vnc; do
             command -v "$c" >/dev/null || MISSING="$MISSING $c"
           done
@@ -271,7 +348,7 @@ jobs:
           else
             echo "✅ All standard commands are available"
           fi
-          echo "⏱ Installation fertig nach $(( $(date +%s) - $(cat /tmp/start-ts) )) Sekunden"
+          echo "⏱ Installation finished after $(( $(date +%s) - $(cat /tmp/start-ts) )) seconds"
 
       - name: Install Google Drive Shell (gdsh)
         run: |
@@ -711,7 +788,7 @@ jobs:
                   root = ensure_mounted(uri)
               except GLib.Error as e:
                   print(f"Could not open Google Drive ({uri}): {e.message}")
-                  print("Tip: open the Google Drive once in 'Dateien (Google Drive)', then run gdsh again.")
+                  print("Tip: open the Google Drive once in 'Files (Google Drive)', then run gdsh again.")
                   return 1
               print(f"Connected: {uri}")
               shell = DriveShell(root)
@@ -737,7 +814,7 @@ jobs:
           sudo systemctl mask NetworkManager 2>/dev/null || true
           sudo pkill -x NetworkManager 2>/dev/null || true
           # Check: internet must still work
-          curl -s --max-time 10 -o /dev/null -w "Internet-Test: HTTP %{http_code}\n" https://www.google.com || echo "⚠️ Kein Internet"
+          curl -s --max-time 10 -o /dev/null -w "Internet test: HTTP %{http_code}\n" https://www.google.com || echo "⚠️ No internet"
 
       - name: Install Cloudflare Zero Trust Root CA (from Secret)
         env:
@@ -746,13 +823,13 @@ jobs:
         run: |
           # Accepts both secret names
           if [ -n "$CF_CA_1" ]; then
-            CF_CA="$CF_CA_1"; echo "Verwende Secret CLOUDFLARE_ROOT_CA_B64"
+            CF_CA="$CF_CA_1"; echo "Using secret CLOUDFLARE_ROOT_CA_B64"
           elif [ -n "$CF_CA_2" ]; then
-            CF_CA="$CF_CA_2"; echo "Verwende Secret CLOUDFLARE_CA_CERT"
+            CF_CA="$CF_CA_2"; echo "Using secret CLOUDFLARE_CA_CERT"
           else
-            echo "❌ FEHLER: Kein Zertifikat-Secret gefunden!"
-            echo "   Lege unter Settings > Secrets and variables > Actions > Repository secrets"
-            echo "   ein Secret namens CLOUDFLARE_ROOT_CA_B64 oder CLOUDFLARE_CA_CERT an."
+            echo "❌ ERROR: No certificate secret found!"
+            echo "   Create a secret named CLOUDFLARE_ROOT_CA_B64 or CLOUDFLARE_CA_CERT under"
+            echo "   Settings > Secrets and variables > Actions > Repository secrets."
             exit 1
           fi
 
@@ -776,12 +853,12 @@ jobs:
 
           # Check that the certificate is valid and not expired
           if ! openssl x509 -in "$CERT" -noout 2>/dev/null; then
-            echo "❌ FEHLER: Der Inhalt des Secrets ist kein gültiges Zertifikat!"
+            echo "❌ ERROR: The secret content is not a valid certificate!"
             exit 1
           fi
-          echo "Zertifikat:"
+          echo "Certificate:"
           openssl x509 -in "$CERT" -noout -subject -enddate -fingerprint -sha256
-          openssl x509 -in "$CERT" -noout -checkend 0 || { echo "❌ Zertifikat ist abgelaufen"; exit 1; }
+          openssl x509 -in "$CERT" -noout -checkend 0 || { echo "❌ Certificate has expired"; exit 1; }
 
           # 1. Trust system-wide (curl, apt etc.)
           sudo cp "$CERT" /usr/local/share/ca-certificates/cloudflare-zt-root.crt
@@ -794,23 +871,81 @@ jobs:
           certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "Cloudflare Zero Trust Root CA" -i "$CERT"
           certutil -d sql:$HOME/.pki/nssdb -L | grep "Cloudflare Zero Trust Root CA"
           rm -f "$CERT"
-          echo "✅ Cloudflare Zero Trust Root CA installiert."
+          echo "✅ Cloudflare Zero Trust Root CA installed."
 
       - name: Configure Launchers & Desktop Session Script
+        env:
+          # Optional repository variable DESKTOP_SCALE (e.g. 1.25 or 1.5) = default text/UI scale
+          DESKTOP_SCALE: ${{ vars.DESKTOP_SCALE }}
         run: |
           mkdir -p ~/.config/autostart ~/Desktop ~/.local/share/applications ~/.config/xfce4/terminal ~/Downloads
 
-          # Chrome launcher (routed through the WARP SOCKS5 proxy, smooth-scrolling off for less lag over VNC)
+          # Default UI scale (only numbers between 1 and 3 are accepted)
+          SCALE="${DESKTOP_SCALE:-1}"
+          if ! printf '%s' "$SCALE" | grep -Eq '^[1-3](\.[0-9]{1,2})?$'; then SCALE=1; fi
+          echo "$SCALE" > ~/.config/desktop-scale
+          echo "Default UI scale: $SCALE"
+
+          # Chrome start script: reads the chosen scale, sharp grayscale text, no smooth scrolling.
+          # REMOVED: --disable-dev-shm-usage (it forced Chrome to use the slow disk instead of RAM = laggy)
+          sudo tee /usr/local/bin/chrome-warp > /dev/null << 'EOF'
+          #!/bin/bash
+          SCALE=$(cat "$HOME/.config/desktop-scale" 2>/dev/null || echo 1)
+          exec /usr/bin/google-chrome-stable \
+            --proxy-server="socks5://127.0.0.1:1080" \
+            --force-device-scale-factor="$SCALE" \
+            --force-dark-mode --enable-features=WebUIDarkMode \
+            --start-maximized --no-first-run --no-default-browser-check \
+            --disable-session-crashed-bubble --password-store=basic \
+            --disable-smooth-scrolling \
+            --disable-lcd-text \
+            --force-color-profile=srgb \
+            "$@"
+          EOF
+          sudo chmod +x /usr/local/bin/chrome-warp
+
+          # Display scale dialog (bigger/smaller text and UI for all apps)
+          sudo tee /usr/local/bin/desktop-scale > /dev/null << 'EOF'
+          #!/bin/bash
+          S="$1"
+          if [ -z "$S" ]; then
+            CUR=$(cat "$HOME/.config/desktop-scale" 2>/dev/null || echo 1)
+            S=$(zenity --list --title="Display scale" --text="Current: $CUR\nChoose a size:" \
+                  --column="Scale" --column="Size" --height=360 --width=320 \
+                  1 "100 % (small)" 1.25 "125 %" 1.5 "150 %" 1.75 "175 %" 2 "200 % (large)") || exit 0
+          fi
+          printf '%s' "$S" | grep -Eq '^[1-3](\.[0-9]{1,2})?$' || exit 1
+          echo "$S" > "$HOME/.config/desktop-scale"
+          gsettings set org.gnome.desktop.interface text-scaling-factor "$S"
+          gsettings set org.gnome.desktop.interface cursor-size "$(python3 -c "print(int(round(24*$S)))")"
+          [ -z "$1" ] && zenity --info --width=320 --text="Done. Please close and reopen Chrome to apply it there." || true
+          EOF
+          sudo chmod +x /usr/local/bin/desktop-scale
+
+          # Chrome launcher (routed through the WARP SOCKS5 proxy)
           cat > ~/Desktop/google-chrome.desktop << 'EOF'
           [Desktop Entry]
           Version=1.0
           Type=Application
           Name=Google Chrome (WARP ZT)
-          Comment=Web-Browser via Cloudflare Zero Trust
-          Exec=/usr/bin/google-chrome-stable --proxy-server="socks5://127.0.0.1:1080" --force-dark-mode --enable-features=WebUIDarkMode --start-maximized --no-first-run --no-default-browser-check --disable-session-crashed-bubble --disable-dev-shm-usage --password-store=basic --disable-smooth-scrolling --disable-gpu-vsync --disable-features=SmoothScrolling %U
+          Comment=Web browser via Cloudflare Zero Trust
+          Exec=/usr/local/bin/chrome-warp %U
           Icon=google-chrome
           Terminal=false
           Categories=Network;WebBrowser;
+          EOF
+
+          # Display scale launcher
+          cat > ~/Desktop/display-scale.desktop << 'EOF'
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=Display scale
+          Comment=Make text and windows bigger or smaller
+          Exec=/usr/local/bin/desktop-scale
+          Icon=preferences-desktop-display
+          Terminal=false
+          Categories=Settings;
           EOF
 
           # GNOME Settings (Online Accounts -> Google Drive)
@@ -819,7 +954,7 @@ jobs:
           Version=1.0
           Type=Application
           Name=Settings (Online Accounts)
-          Comment=GNOME Settings – Google-Konto für Google Drive hinzufügen
+          Comment=GNOME Settings - add a Google account for Google Drive
           Exec=env GIO_USE_NETWORK_MONITOR=netlink XDG_CURRENT_DESKTOP=GNOME gnome-control-center online-accounts
           Icon=org.gnome.Settings
           Terminal=false
@@ -831,7 +966,7 @@ jobs:
           [Desktop Entry]
           Version=1.0
           Type=Application
-          Name=Dateien (Google Drive)
+          Name=Files (Google Drive)
           Exec=nautilus --new-window
           Icon=org.gnome.Nautilus
           Terminal=false
@@ -880,6 +1015,22 @@ jobs:
           ColorForeground=#e6e6e6
           ColorBackground=#1e1e1e
           ColorCursor=#e6e6e6
+          EOF
+
+          # Sharp fonts for apps that read fontconfig directly: grayscale antialiasing, slight hinting
+          mkdir -p ~/.config/fontconfig
+          cat > ~/.config/fontconfig/fonts.conf << 'EOF'
+          <?xml version="1.0"?>
+          <!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+          <fontconfig>
+            <match target="font">
+              <edit name="antialias" mode="assign"><bool>true</bool></edit>
+              <edit name="hinting" mode="assign"><bool>true</bool></edit>
+              <edit name="hintstyle" mode="assign"><const>hintslight</const></edit>
+              <edit name="rgba" mode="assign"><const>none</const></edit>
+              <edit name="lcdfilter" mode="assign"><const>lcdnone</const></edit>
+            </match>
+          </fontconfig>
           EOF
 
           # Comfortable bash: short colored prompt, CMD-like aliases, fast search and folder jumps
@@ -950,6 +1101,22 @@ jobs:
           gsettings set org.gnome.desktop.interface enable-animations false || true
           gsettings set org.gnome.metacity compositing-manager false 2>/dev/null || true
 
+          # PERFORMANCE: plain dark background instead of a picture (less data on every window move)
+          gsettings set org.gnome.desktop.background picture-options 'none' 2>/dev/null || true
+          gsettings set org.gnome.desktop.background color-shading-type 'solid' 2>/dev/null || true
+          gsettings set org.gnome.desktop.background primary-color '#202124' 2>/dev/null || true
+
+          # SHARPNESS: grayscale font smoothing (no coloured fringes, compresses cleaner over VNC)
+          gsettings set org.gnome.desktop.interface font-antialiasing 'grayscale' 2>/dev/null || true
+          gsettings set org.gnome.desktop.interface font-hinting 'slight' 2>/dev/null || true
+          gsettings set org.gnome.settings-daemon.plugins.xsettings antialiasing 'grayscale' 2>/dev/null || true
+          gsettings set org.gnome.settings-daemon.plugins.xsettings hinting 'slight' 2>/dev/null || true
+
+          # UI scale chosen in the workflow (or later via "Display scale")
+          SCALE=$(cat "$HOME/.config/desktop-scale" 2>/dev/null || echo 1)
+          gsettings set org.gnome.desktop.interface text-scaling-factor "$SCALE" 2>/dev/null || true
+          gsettings set org.gnome.desktop.interface cursor-size "$(python3 -c "print(int(round(24*$SCALE)))")" 2>/dev/null || true
+
           for f in "$HOME"/Desktop/*.desktop; do gio set "$f" metadata::trusted true 2>/dev/null || true; done
 
           # Terminal look (xfce4-terminal 1.x stores settings in xfconf)
@@ -967,16 +1134,23 @@ jobs:
             xt /color-cursor string "#e6e6e6"
           fi
 
+          # gsd-xsettings passes font smoothing + scale to ALL apps (Chrome, Files, Terminal, Settings)
+          XSETTINGS=""
+          for p in /usr/libexec/gsd-xsettings /usr/lib/gnome-settings-daemon/gsd-xsettings; do
+            [ -x "$p" ] && { XSETTINGS="$p"; break; }
+          done
+
           start_if_missing() {
             local name="$1"; shift
             if ! pgrep -u "$(id -u)" -x "$name" >/dev/null; then
-              echo "$(date '+%H:%M:%S') starte $name"
+              echo "$(date '+%H:%M:%S') starting $name"
               "$@" >> "/tmp/desktop-$name.log" 2>&1 &
               sleep 1
             fi
           }
 
           while true; do
+            [ -n "$XSETTINGS" ] && start_if_missing gsd-xsettings "$XSETTINGS"
             start_if_missing metacity metacity --replace
             start_if_missing gnome-flashback gnome-flashback
             start_if_missing gnome-panel gnome-panel
@@ -985,22 +1159,31 @@ jobs:
           EOF
           chmod +x ~/desktop-session.sh
 
+          # Helper: give the picture pipeline (VNC server, web proxy, tunnel) priority over everything else
+          sudo tee /usr/local/bin/boost-priority > /dev/null << 'EOF'
+          #!/bin/bash
+          for p in $(pgrep -x Xtigervnc; pgrep -x Xvfb; pgrep -x x11vnc; pgrep -f websockify; pgrep -x cloudflared); do
+            sudo renice -n -10 -p "$p" > /dev/null 2>&1 || true
+          done
+          EOF
+          sudo chmod +x /usr/local/bin/boost-priority
+
       - name: Start Display, Desktop Session & VNC
         run: |
           # 1. Virtual display + VNC server.
           #    Preferred: TigerVNC (display and VNC in ONE process = faster, better compression, supports remote resize).
-          #    Fallback: Xvfb + x11vnc (the old way) if TigerVNC does not start.
+          #    Fallback: Xvfb + x11vnc if TigerVNC does not start.
           VNC_OK=0
           if command -v Xtigervnc >/dev/null; then
-            nohup Xtigervnc :99 -geometry 1600x900 -depth 24 \
+            nohup Xtigervnc :99 -geometry 1920x1080 -depth 24 -dpi 96 \
               -rfbport 5900 -SecurityTypes None -localhost \
-              -AlwaysShared -ac -FrameRate 60 > /tmp/xvnc.log 2>&1 &
+              -AlwaysShared -ac -FrameRate 60 -CompareFB 2 > /tmp/xvnc.log 2>&1 &
             for i in $(seq 1 20); do
               xdpyinfo -display :99 >/dev/null 2>&1 && { VNC_OK=1; break; }
               sleep 0.5
             done
             if [ "$VNC_OK" != "1" ]; then
-              echo "⚠️ Xtigervnc startet nicht - wechsle auf Xvfb + x11vnc. Log:"
+              echo "⚠️ Xtigervnc does not start - switching to Xvfb + x11vnc. Log:"
               cat /tmp/xvnc.log
               pkill -x Xtigervnc 2>/dev/null || true
               sleep 1
@@ -1009,30 +1192,31 @@ jobs:
 
           if [ "$VNC_OK" = "1" ]; then
             echo "tigervnc" > /tmp/vnc-mode
-            echo "✅ TigerVNC läuft (1600x900)."
+            echo "✅ TigerVNC running."
           else
-            nohup Xvfb :99 -screen 0 1600x900x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
+            nohup Xvfb :99 -screen 0 1920x1080x24 -dpi 96 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
             for i in $(seq 1 20); do
               xdpyinfo -display :99 >/dev/null 2>&1 && break
               sleep 0.5
             done
-            xdpyinfo -display :99 >/dev/null 2>&1 || { echo "❌ Xvfb startet nicht"; cat /tmp/xvfb.log; exit 1; }
+            xdpyinfo -display :99 >/dev/null 2>&1 || { echo "❌ Xvfb does not start"; cat /tmp/xvfb.log; exit 1; }
             echo "xvfb" > /tmp/vnc-mode
           fi
 
           # 2. Start the desktop session with watchdog (keeps running on its own, we do NOT wait for it here)
           nohup setsid bash ~/desktop-session.sh > /tmp/desktop-session.log 2>&1 &
 
-          # 3. Only for the fallback: separate VNC server (without password, local only, shorter wait times = smoother)
+          # 3. Only for the fallback: separate VNC server (no password, local only, short wait times = smoother)
           if [ "$(cat /tmp/vnc-mode)" = "xvfb" ]; then
             x11vnc -nopw -localhost -rfbport 5900 -forever -shared -display :99 -wait 5 -defer 5 -bg -o /tmp/x11vnc.log
-            echo "✅ Fallback x11vnc läuft."
+            echo "✅ Fallback x11vnc running."
           fi
 
           # 4. noVNC web proxy (port 6080, local only)
           nohup websockify --web=/usr/share/novnc/ 127.0.0.1:6080 localhost:5900 > /tmp/websockify.log 2>&1 &
           sleep 1
-          echo "⏱ Display + VNC laufen nach $(( $(date +%s) - $(cat /tmp/start-ts) )) Sekunden (Modus: $(cat /tmp/vnc-mode))"
+          boost-priority
+          echo "⏱ Display + VNC running after $(( $(date +%s) - $(cat /tmp/start-ts) )) seconds (mode: $(cat /tmp/vnc-mode))"
 
       - name: Hand over (wait until the previous desktop has finished)
         if: github.event.inputs.handover == 'true'
@@ -1045,20 +1229,20 @@ jobs:
         run: |
           # This desktop is fully prepared. It takes over the tunnel the moment the older run has ended.
           WF_FILE=$(basename "${WORKFLOW_REF%@*}")
-          echo "Neuer Desktop ist vorbereitet ($(( $(date +%s) - $(cat /tmp/start-ts) )) s). Warte, bis der alte Desktop beendet ist ..."
+          echo "New desktop is ready ($(( $(date +%s) - $(cat /tmp/start-ts) )) s). Waiting until the old desktop has finished ..."
           FAIL=0
           for i in $(seq 1 360); do   # 360 x 5 s = at most 30 minutes
             if gh api "repos/$REPO/actions/workflows/$WF_FILE/runs?status=in_progress&per_page=100" > /tmp/old.json 2>/dev/null; then
               FAIL=0
               N=$(jq --argjson id "$RUN_ID" --argjson num "$RUN_NUMBER" '[.workflow_runs[] | select(.id != $id and .run_number < $num)] | length' /tmp/old.json)
               if [ "${N:-1}" = "0" ]; then
-                echo "✅ Alter Desktop ist beendet - übernehme jetzt."
+                echo "✅ Old desktop has finished - taking over now."
                 break
               fi
             else
               FAIL=$((FAIL + 1))
               if [ "$FAIL" -ge 5 ]; then
-                echo "⚠️ GitHub-API nicht erreichbar - übernehme trotzdem."
+                echo "⚠️ GitHub API not reachable - taking over anyway."
                 break
               fi
             fi
@@ -1070,7 +1254,7 @@ jobs:
           TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
         run: |
           if [ -z "$TUNNEL_TOKEN" ]; then
-            echo "❌ FEHLER: Secret CLOUDFLARE_TUNNEL_TOKEN ist nicht gesetzt!"
+            echo "❌ ERROR: Secret CLOUDFLARE_TUNNEL_TOKEN is not set!"
             exit 1
           fi
 
@@ -1080,6 +1264,7 @@ jobs:
             grep -q "Registered tunnel connection" /tmp/cloudflared.log 2>/dev/null && break
             sleep 0.5
           done
+          boost-priority
 
           # Make sure the desktop panel is up (max. 20 seconds)
           for i in $(seq 1 20); do
@@ -1087,18 +1272,19 @@ jobs:
             sleep 1
           done
 
-          echo "--- Desktop-Status ---"
+          echo "--- Desktop status ---"
           cat /tmp/desktop-session.log
-          pgrep -a -x metacity || echo "⚠️ metacity läuft nicht"
-          pgrep -a -x gnome-flashback || echo "⚠️ gnome-flashback läuft nicht"
-          pgrep -a -x gnome-panel || echo "⚠️ gnome-panel läuft nicht"
+          pgrep -a -x metacity || echo "⚠️ metacity is not running"
+          pgrep -a -x gnome-flashback || echo "⚠️ gnome-flashback is not running"
+          pgrep -a -x gnome-panel || echo "⚠️ gnome-panel is not running"
+          pgrep -a -x gsd-xsettings || echo "⚠️ gsd-xsettings is not running (fonts/scale may look different)"
 
           echo "=========================================="
-          echo "✅ GNOME Remote Desktop läuft und ist via Cloudflare Zero Trust erreichbar."
-          echo "   Rufe https://DEINE-SUBDOMAIN.DEINE-DOMAIN.com/ auf (nutzt automatisch die schnellen Einstellungen)"
-          echo "   oder direkt: https://DEINE-SUBDOMAIN.DEINE-DOMAIN.com/vnc.html?autoconnect=true&resize=remote&quality=6&compression=4"
-          echo "   VNC-Modus: $(cat /tmp/vnc-mode)"
-          echo "   Desktop bereit nach $(( $(date +%s) - $(cat /tmp/start-ts) )) Sekunden."
+          echo "✅ GNOME Remote Desktop is running and reachable via Cloudflare Zero Trust."
+          echo "   Open https://YOUR-SUBDOMAIN.YOUR-DOMAIN.com/ (uses the sharp + smooth settings automatically)"
+          echo "   or directly: https://YOUR-SUBDOMAIN.YOUR-DOMAIN.com/vnc.html?autoconnect=true&resize=remote&quality=9&compression=2&reconnect=true"
+          echo "   VNC mode: $(cat /tmp/vnc-mode)"
+          echo "   Desktop ready after $(( $(date +%s) - $(cat /tmp/start-ts) )) seconds."
           echo "=========================================="
 
       - name: Wait for WARP (started in background at the beginning)
@@ -1109,15 +1295,15 @@ jobs:
             [ -f /tmp/warp.failed ] && break
             sleep 3
           done
-          echo "---------- WARP-Log ----------"
+          echo "---------- WARP log ----------"
           cat /tmp/warp-setup.log 2>/dev/null || true
           echo "------------------------------"
           if [ -f /tmp/warp.failed ]; then
-            echo "⚠️ WARP-Setup ist fehlgeschlagen. Chrome lädt dann keine Seiten (kein Datenleck)."
+            echo "⚠️ WARP setup failed. Chrome will not load pages (no data leak)."
           elif [ ! -f /tmp/warp.done ]; then
-            echo "⚠️ WARP war nach 5 Minuten noch nicht fertig. Log siehe oben."
+            echo "⚠️ WARP was not finished after 5 minutes. See log above."
           fi
-          echo "Gesamtzeit bis hierher: $(( $(date +%s) - $(cat /tmp/start-ts) )) Sekunden."
+          echo "Total time so far: $(( $(date +%s) - $(cat /tmp/start-ts) )) seconds."
 
       - name: Keep Alive (starts the next desktop early, then ends)
         env:
@@ -1126,12 +1312,13 @@ jobs:
         run: |
           health() {
             if [ "$(cat /tmp/vnc-mode 2>/dev/null)" = "tigervnc" ]; then
-              pgrep -x Xtigervnc >/dev/null || echo "⚠️ Xtigervnc läuft nicht mehr"
+              pgrep -x Xtigervnc >/dev/null || echo "⚠️ Xtigervnc is no longer running"
             else
-              pgrep -x Xvfb >/dev/null   || echo "⚠️ Xvfb läuft nicht mehr"
-              pgrep -x x11vnc >/dev/null || echo "⚠️ x11vnc läuft nicht mehr"
+              pgrep -x Xvfb >/dev/null   || echo "⚠️ Xvfb is no longer running"
+              pgrep -x x11vnc >/dev/null || echo "⚠️ x11vnc is no longer running"
             fi
-            pgrep -x cloudflared >/dev/null || echo "⚠️ cloudflared läuft nicht mehr"
+            pgrep -x cloudflared >/dev/null || echo "⚠️ cloudflared is no longer running"
+            echo "Load: $(cut -d' ' -f1-3 /proc/loadavg) | Free RAM: $(free -m | awk '/Mem:/ {print $7}') MB"
           }
 
           # Timeline (counted from the start of this job):
@@ -1141,7 +1328,7 @@ jobs:
           HANDOVER_AT=$((START + 315 * 60))
           END_AT=$((START + 335 * 60))
 
-          echo "Desktop aktiv. Der Nachfolger wird in $(( (HANDOVER_AT - $(date +%s)) / 60 )) Minuten gestartet."
+          echo "Desktop active. The successor starts in $(( (HANDOVER_AT - $(date +%s)) / 60 )) minutes."
           N=0
           while [ "$(date +%s)" -lt "$HANDOVER_AT" ]; do
             sleep 30
@@ -1149,12 +1336,13 @@ jobs:
             if [ $((N % 30)) -eq 0 ]; then
               echo "Minute $(( ($(date +%s) - START) / 60 ))"
               health
+              boost-priority
             fi
           done
 
           # Find the workflow file name automatically
           WF_FILE=$(basename "${WORKFLOW_REF%@*}")
-          echo "Starte Nachfolger (Auto-Neustart) für $WF_FILE ..."
+          echo "Starting successor (auto restart) for $WF_FILE ..."
           for TRY in 1 2 3 4 5; do
             CODE=$(curl -s -o /tmp/dispatch.out -w '%{http_code}' -X POST \
               -H "Accept: application/vnd.github+json" \
@@ -1163,16 +1351,16 @@ jobs:
               "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$WF_FILE/dispatches" \
               -d "{\"ref\":\"${{ github.ref_name }}\",\"inputs\":{\"handover\":\"true\"}}")
             if [ "$CODE" = "204" ]; then
-              echo "✅ Nachfolger wurde gestartet."
+              echo "✅ Successor started."
               break
             fi
-            echo "⚠️ Start des Nachfolgers fehlgeschlagen (HTTP $CODE): $(cat /tmp/dispatch.out) - Versuch $TRY/5"
+            echo "⚠️ Starting the successor failed (HTTP $CODE): $(cat /tmp/dispatch.out) - attempt $TRY/5"
             sleep 10
           done
 
-          echo "Dieser Desktop läuft noch $(( (END_AT - $(date +%s)) / 60 )) Minuten, dann übernimmt der neue."
+          echo "This desktop keeps running for $(( (END_AT - $(date +%s)) / 60 )) more minutes, then the new one takes over."
           while [ "$(date +%s)" -lt "$END_AT" ]; do
             sleep 20
           done
 
-          echo "Dieser Lauf endet jetzt - der nachrückende Lauf hat übernommen oder übernimmt in Kürze."
+          echo "This run ends now - the next run has taken over or will do so shortly."
