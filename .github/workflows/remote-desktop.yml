@@ -178,9 +178,12 @@ jobs:
           nohup setsid bash ~/warp-setup.sh > /dev/null 2>&1 &
           echo "WARP setup runs in the background (log: /tmp/warp-setup.log)"
 
-      - name: Install Desktop, Chrome, Terminal & Tools (one single apt run)
+      - name: Install Desktop, Chrome, VS Code, Terminal & Tools (one single apt run)
         run: |
           export DEBIAN_FRONTEND=noninteractive
+
+          # VS Code: do not let the package add its own apt repository (keeps apt fast and clean)
+          echo "code code/add-microsoft-repo boolean false" | sudo debconf-set-selections
 
           # Download .deb files in parallel while apt loads the package lists.
           # Chrome is skipped if the runner image already has it (saves download + install time).
@@ -190,6 +193,10 @@ jobs:
           curl -fsSL -o /tmp/dl/cloudflared-linux-amd64.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb &
           PIDS+=($!)
           DEBS+=(/tmp/dl/cloudflared-linux-amd64.deb)
+          # NEW: Visual Studio Code (official Microsoft .deb, always the latest stable version)
+          curl -fsSL -o /tmp/dl/code_amd64.deb "https://update.code.visualstudio.com/latest/linux-deb-x64/stable" &
+          PIDS+=($!)
+          DEBS+=(/tmp/dl/code_amd64.deb)
           if [ -x /usr/bin/google-chrome-stable ]; then
             echo "Chrome is already installed on the runner - skipping download."
           else
@@ -204,7 +211,9 @@ jobs:
           chmod 644 /tmp/dl/*.deb
 
           # Everything in ONE apt call. Tools already on the runner are skipped by apt.
-          # NEW: gnome-settings-daemon (provides gsd-xsettings = sharp fonts + scaling for all apps), zenity (scale dialog)
+          # gnome-settings-daemon (provides gsd-xsettings = sharp fonts + scaling for all apps), zenity (scale dialog)
+          # NEW: libsecret-1-0 + libsecret-tools (VS Code / Antigravity store logins in the GNOME keyring),
+          #      desktop-file-utils + xdg-utils (app launchers, open links in the browser)
           sudo apt-get install -y "${DEBS[@]}" \
             gnome-session-flashback \
             gnome-flashback \
@@ -261,7 +270,11 @@ jobs:
             tmux \
             lsof \
             psmisc \
-            xclip
+            xclip \
+            libsecret-1-0 \
+            libsecret-tools \
+            desktop-file-utils \
+            xdg-utils
           rm -rf /tmp/dl
 
           # Ubuntu names some tools differently: make "fd" and "bat" work as usual
@@ -340,15 +353,126 @@ jobs:
           MISSING=""
           for c in cp mv rm mkdir ls cat find grep sed awk tar gzip bzip2 xz zip unzip 7z bsdtar rsync \
                    nano git jq rg fd bat curl wget less file tree htop ncdu mc fzf zoxide tmux zenity \
-                   xfce4-terminal python3 google-chrome-stable cloudflared Xtigervnc Xvfb x11vnc; do
+                   xfce4-terminal python3 google-chrome-stable cloudflared Xtigervnc Xvfb x11vnc code; do
             command -v "$c" >/dev/null || MISSING="$MISSING $c"
           done
           if [ -n "$MISSING" ]; then
             echo "⚠️ Missing commands:$MISSING"
           else
-            echo "✅ All standard commands are available"
+            echo "✅ All standard commands are available (incl. VS Code: $(code --version 2>/dev/null | head -1))"
           fi
           echo "⏱ Installation finished after $(( $(date +%s) - $(cat /tmp/start-ts) )) seconds"
+
+      # ------------------------------------------------------------------
+      # NEW: Antigravity IDE, Antigravity CLI (agy) and GitHub Copilot CLI (copilot).
+      # Runs in the BACKGROUND so the desktop is not delayed. The launchers work as soon as it is done.
+      # ------------------------------------------------------------------
+      - name: Install Antigravity, Antigravity CLI & Copilot CLI (background)
+        run: |
+          # Electron apps (VS Code, Antigravity) need user namespaces for their sandbox.
+          # Ubuntu 24.04 blocks them by default via AppArmor -> apps would not open.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 > /dev/null 2>&1 || true
+
+          cat > ~/devtools-setup.sh << 'DEVSCRIPT'
+          #!/bin/bash
+          exec > /tmp/devtools-setup.log 2>&1
+          rm -f /tmp/devtools.done
+          mkdir -p "$HOME/.local/bin"
+          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+
+          # ---------- 1. GitHub Copilot CLI (official install script, installs to /usr/local/bin) ----------
+          echo "== Copilot CLI =="
+          for TRY in 1 2 3; do
+            curl -fsSL https://gh.io/copilot-install | sudo bash && break
+            echo "Attempt $TRY failed, retrying ..."; sleep 5
+          done
+          command -v copilot && echo "✅ Copilot CLI: $(copilot --version 2>/dev/null | head -1)" || echo "⚠️ Copilot CLI not installed"
+
+          # ---------- 2. Antigravity CLI "agy" (official install script, installs to ~/.local/bin) ----------
+          echo "== Antigravity CLI =="
+          for TRY in 1 2 3; do
+            curl -fsSL https://antigravity.google/cli/install.sh | bash && break
+            echo "Attempt $TRY failed, retrying ..."; sleep 5
+          done
+          AGY=$(command -v agy || ls "$HOME"/.local/bin/agy 2>/dev/null || true)
+          if [ -n "$AGY" ]; then
+            sudo ln -sf "$AGY" /usr/local/bin/agy
+            echo "✅ Antigravity CLI: $(agy --version 2>/dev/null | head -1)"
+          else
+            echo "⚠️ Antigravity CLI not installed"
+          fi
+
+          # ---------- 3. Antigravity IDE ----------
+          # Preferred: current IDE tarball from Google's download page.
+          # Fallback: Google's official Antigravity apt repository (older 1.x IDE, but always works).
+          echo "== Antigravity IDE =="
+          URL_RE='https://[A-Za-z0-9._~:/?#@!$&+,;=%-]+\.tar\.gz'
+          PAGE=$(curl -fsSL --max-time 30 https://antigravity.google/download || true)
+          URLS=$(printf '%s' "$PAGE" | grep -oE "$URL_RE" || true)
+          for js in $(printf '%s' "$PAGE" | grep -oE '(src|href)="[^"]+\.js"' | sed -E 's/^(src|href)="//; s/"$//' | sort -u); do
+            case "$js" in
+              http*) u="$js" ;;
+              /*)    u="https://antigravity.google$js" ;;
+              *)     u="https://antigravity.google/$js" ;;
+            esac
+            URLS="$URLS
+          $(curl -fsSL --max-time 20 "$u" 2>/dev/null | grep -oE "$URL_RE" || true)"
+          done
+          LINUX_URLS=$(printf '%s\n' "$URLS" | grep -i linux | grep -Ei 'x64|amd64|x86_64' | sort -u || true)
+          echo "Linux tarballs found:"; printf '%s\n' "$LINUX_URLS"
+          IDE_URL=$(printf '%s\n' "$LINUX_URLS" | grep -i 'ide' | head -1 || true)
+
+          IDE_OK=0
+          if [ -n "$IDE_URL" ]; then
+            echo "Downloading $IDE_URL"
+            rm -rf /tmp/ag-ide /tmp/ag-ide.tar.gz && mkdir -p /tmp/ag-ide
+            if curl -fL --retry 3 -o /tmp/ag-ide.tar.gz "$IDE_URL" && tar -xzf /tmp/ag-ide.tar.gz -C /tmp/ag-ide; then
+              # Use the single top folder of the archive if there is one
+              TOP=/tmp/ag-ide
+              if [ "$(find /tmp/ag-ide -mindepth 1 -maxdepth 1 | wc -l)" = "1" ] && [ -d "$(find /tmp/ag-ide -mindepth 1 -maxdepth 1)" ]; then
+                TOP=$(find /tmp/ag-ide -mindepth 1 -maxdepth 1)
+              fi
+              sudo rm -rf /opt/antigravity-ide
+              sudo mv "$TOP" /opt/antigravity-ide
+              BIN=$(find /opt/antigravity-ide -maxdepth 1 -type f -perm -u+x \( -name 'antigravity-ide' -o -name 'antigravity' -o -name 'Antigravity*' \) | head -1)
+              [ -z "$BIN" ] && BIN=$(find /opt/antigravity-ide -maxdepth 2 -type f -perm -u+x \( -name 'antigravity-ide' -o -name 'antigravity' \) | head -1)
+              if [ -n "$BIN" ]; then
+                # Chromium sandbox helper must belong to root with the setuid bit
+                SB=$(find /opt/antigravity-ide -maxdepth 2 -name chrome-sandbox | head -1)
+                [ -n "$SB" ] && sudo chown root:root "$SB" && sudo chmod 4755 "$SB"
+                sudo ln -sf "$BIN" /usr/local/bin/antigravity
+                ICON=$(find /opt/antigravity-ide -type f \( -iname '*antigravity*.png' -o -iname 'code.png' \) | head -1)
+                [ -n "$ICON" ] && sudo cp "$ICON" /usr/local/share/antigravity.png
+                IDE_OK=1
+                echo "✅ Antigravity IDE installed from tarball: $BIN"
+              fi
+            fi
+            rm -rf /tmp/ag-ide /tmp/ag-ide.tar.gz
+          fi
+
+          if [ "$IDE_OK" != "1" ]; then
+            echo "No current IDE tarball found - using Google's Antigravity apt repository."
+            sudo mkdir -p /etc/apt/keyrings
+            curl -fsSL https://us-central1-apt.pkg.dev/doc/repo-signing-key.gpg | sudo gpg --yes --dearmor -o /etc/apt/keyrings/antigravity-repo-key.gpg
+            echo "deb [signed-by=/etc/apt/keyrings/antigravity-repo-key.gpg] https://us-central1-apt.pkg.dev/projects/antigravity-auto-updater-dev/ antigravity-debian main" | sudo tee /etc/apt/sources.list.d/antigravity.list > /dev/null
+            # wait if apt is still busy
+            for i in $(seq 1 60); do sudo fuser /var/lib/dpkg/lock-frontend > /dev/null 2>&1 || break; sleep 2; done
+            sudo DEBIAN_FRONTEND=noninteractive apt-get update -o Dir::Etc::sourcelist=sources.list.d/antigravity.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0
+            if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y antigravity; then
+              IDE_OK=1
+              ICON=$(find /usr/share -type f -iname '*antigravity*.png' 2>/dev/null | head -1)
+              [ -n "$ICON" ] && sudo cp "$ICON" /usr/local/share/antigravity.png
+              echo "✅ Antigravity IDE installed from apt"
+            fi
+          fi
+          [ "$IDE_OK" = "1" ] || echo "⚠️ Antigravity IDE could not be installed"
+
+          touch /tmp/devtools.done
+          DEVSCRIPT
+          chmod +x ~/devtools-setup.sh
+
+          nohup setsid bash ~/devtools-setup.sh > /dev/null 2>&1 &
+          echo "Antigravity / Antigravity CLI / Copilot CLI install in the background (log: /tmp/devtools-setup.log)"
 
       - name: Install Google Drive Shell (gdsh)
         run: |
@@ -904,6 +1028,29 @@ jobs:
           EOF
           sudo chmod +x /usr/local/bin/chrome-warp
 
+          # NEW: VS Code start script (no GPU in VNC = smoother, logins saved in the GNOME keyring)
+          sudo tee /usr/local/bin/vscode-launch > /dev/null << 'EOF'
+          #!/bin/bash
+          exec /usr/bin/code --disable-gpu --password-store=gnome-libsecret "$@"
+          EOF
+          sudo chmod +x /usr/local/bin/vscode-launch
+
+          # NEW: Antigravity start script (waits politely if the background installation is not finished yet)
+          sudo tee /usr/local/bin/antigravity-launch > /dev/null << 'EOF'
+          #!/bin/bash
+          for b in /usr/local/bin/antigravity /usr/bin/antigravity; do
+            if [ -x "$b" ]; then
+              exec "$b" --disable-gpu --password-store=gnome-libsecret "$@"
+            fi
+          done
+          if [ ! -f /tmp/devtools.done ]; then
+            zenity --info --width=360 --text="Antigravity is still being installed in the background.\nPlease try again in a minute." 2>/dev/null
+          else
+            zenity --error --width=360 --text="Antigravity could not be installed.\nSee /tmp/devtools-setup.log" 2>/dev/null
+          fi
+          EOF
+          sudo chmod +x /usr/local/bin/antigravity-launch
+
           # Display scale dialog (bigger/smaller text and UI for all apps)
           sudo tee /usr/local/bin/desktop-scale > /dev/null << 'EOF'
           #!/bin/bash
@@ -933,6 +1080,46 @@ jobs:
           Icon=google-chrome
           Terminal=false
           Categories=Network;WebBrowser;
+          MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
+          EOF
+
+          # NEW: VS Code launcher
+          cat > ~/Desktop/vscode.desktop << 'EOF'
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=Visual Studio Code
+          Comment=Code editor
+          Exec=/usr/local/bin/vscode-launch --new-window %F
+          Icon=vscode
+          Terminal=false
+          Categories=Development;IDE;
+          EOF
+
+          # NEW: Antigravity launcher
+          cat > ~/Desktop/antigravity.desktop << 'EOF'
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=Antigravity
+          Comment=Google Antigravity IDE
+          Exec=/usr/local/bin/antigravity-launch %F
+          Icon=/usr/local/share/antigravity.png
+          Terminal=false
+          Categories=Development;IDE;
+          EOF
+
+          # NEW: AI terminal (shows how to start Copilot CLI and Antigravity CLI)
+          cat > ~/Desktop/ai-terminal.desktop << 'EOF'
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=AI Terminal (copilot / agy)
+          Comment=Terminal for GitHub Copilot CLI and Antigravity CLI
+          Exec=xfce4-terminal --geometry=110x30 --hide-menubar --hide-toolbar --title="AI Terminal" -x bash -c "echo 'GitHub Copilot CLI:  copilot   (first time: /login)'; echo 'Antigravity CLI:     agy       (first time: sign in with Google)'; echo; exec bash"
+          Icon=utilities-terminal
+          Terminal=false
+          Categories=System;Development;
           EOF
 
           # Display scale launcher
@@ -1002,6 +1189,16 @@ jobs:
           chmod +x ~/Desktop/*.desktop
           cp ~/Desktop/*.desktop ~/.local/share/applications/
 
+          # NEW: links and sign-in pages from VS Code / Antigravity / CLIs open in Chrome (WARP)
+          xdg-mime default google-chrome.desktop x-scheme-handler/http x-scheme-handler/https text/html 2>/dev/null || true
+          mkdir -p ~/.config
+          cat > ~/.config/mimeapps.list << 'EOF'
+          [Default Applications]
+          x-scheme-handler/http=google-chrome.desktop
+          x-scheme-handler/https=google-chrome.desktop
+          text/html=google-chrome.desktop
+          EOF
+
           # Terminal look (fallback for older xfce4-terminal versions; newer ones are set via xfconf in the session script)
           cat > ~/.config/xfce4/terminal/terminalrc << 'EOF'
           [Configuration]
@@ -1040,6 +1237,7 @@ jobs:
           export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
           export EDITOR=nano
           export VISUAL=nano
+          export BROWSER=/usr/local/bin/chrome-warp
           PS1='\[\e[1;32m\]\u\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
           alias ls='ls --color=auto --group-directories-first'
           alias ll='ls -alh'
@@ -1053,6 +1251,9 @@ jobs:
           alias du='du -h'
           alias free='free -h'
           alias drive='gdsh'
+          # NEW: open VS Code / Antigravity from the terminal, e.g. "code ." or "ag ."
+          alias code='/usr/local/bin/vscode-launch'
+          alias ag='/usr/local/bin/antigravity-launch'
           # Unpack almost any archive: x file.zip / file.tar.gz / file.7z / file.rar
           x() { [ -f "$1" ] || { echo "File not found: $1"; return 1; }; bsdtar -xvf "$1"; }
           HISTSIZE=10000
@@ -1074,6 +1275,8 @@ jobs:
           export XDG_SESSION_DESKTOP=gnome-flashback-metacity
           export DESKTOP_SESSION=gnome-flashback-metacity
           export NO_AT_BRIDGE=1
+          export BROWSER=/usr/local/bin/chrome-warp
+          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
           # Check network state directly instead of via NetworkManager (fixes "offline")
           export GIO_USE_NETWORK_MONITOR=netlink
           export XDG_RUNTIME_DIR="/tmp/runtime-$(id -u)"
@@ -1082,9 +1285,9 @@ jobs:
           # Own D-Bus session
           eval "$(dbus-launch --sh-syntax)"
           export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
-          dbus-update-activation-environment GIO_USE_NETWORK_MONITOR DISPLAY XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR 2>/dev/null || true
+          dbus-update-activation-environment GIO_USE_NETWORK_MONITOR DISPLAY XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR BROWSER PATH 2>/dev/null || true
 
-          # Unlock keyring with empty password (for Online Accounts / Google Drive)
+          # Unlock keyring with empty password (for Online Accounts / Google Drive / VS Code / Antigravity)
           echo -n "" | gnome-keyring-daemon --unlock --components=secrets,pkcs11 >/dev/null 2>&1 || true
           eval "$(gnome-keyring-daemon --start --components=secrets,pkcs11 2>/dev/null)" || true
           export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
@@ -1304,6 +1507,26 @@ jobs:
             echo "⚠️ WARP was not finished after 5 minutes. See log above."
           fi
           echo "Total time so far: $(( $(date +%s) - $(cat /tmp/start-ts) )) seconds."
+
+      # NEW: only shows the result. The desktop is already usable, nothing waits for this step.
+      - name: Check VS Code, Antigravity, Antigravity CLI & Copilot CLI
+        run: |
+          for i in $(seq 1 100); do
+            [ -f /tmp/devtools.done ] && break
+            sleep 3
+          done
+          echo "---------- Dev tools log ----------"
+          cat /tmp/devtools-setup.log 2>/dev/null || true
+          echo "-----------------------------------"
+          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+          echo "VS Code:          $(code --version 2>/dev/null | head -1 || echo 'missing')"
+          if [ -x /usr/local/bin/antigravity ] || [ -x /usr/bin/antigravity ]; then
+            echo "Antigravity IDE:  installed"
+          else
+            echo "Antigravity IDE:  ⚠️ missing"
+          fi
+          echo "Antigravity CLI:  $(command -v agy >/dev/null && (agy --version 2>/dev/null | head -1 || echo installed) || echo '⚠️ missing')"
+          echo "Copilot CLI:      $(command -v copilot >/dev/null && (copilot --version 2>/dev/null | head -1 || echo installed) || echo '⚠️ missing')"
 
       - name: Keep Alive (starts the next desktop early, then ends)
         env:
