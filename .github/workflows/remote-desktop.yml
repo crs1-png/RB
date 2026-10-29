@@ -193,7 +193,7 @@ jobs:
           curl -fsSL -o /tmp/dl/cloudflared-linux-amd64.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb &
           PIDS+=($!)
           DEBS+=(/tmp/dl/cloudflared-linux-amd64.deb)
-          # NEW: Visual Studio Code (official Microsoft .deb, always the latest stable version)
+          # Visual Studio Code (official Microsoft .deb, always the latest stable version)
           curl -fsSL -o /tmp/dl/code_amd64.deb "https://update.code.visualstudio.com/latest/linux-deb-x64/stable" &
           PIDS+=($!)
           DEBS+=(/tmp/dl/code_amd64.deb)
@@ -211,9 +211,6 @@ jobs:
           chmod 644 /tmp/dl/*.deb
 
           # Everything in ONE apt call. Tools already on the runner are skipped by apt.
-          # gnome-settings-daemon (provides gsd-xsettings = sharp fonts + scaling for all apps), zenity (scale dialog)
-          # NEW: libsecret-1-0 + libsecret-tools (VS Code / Antigravity store logins in the GNOME keyring),
-          #      desktop-file-utils + xdg-utils (app launchers, open links in the browser)
           sudo apt-get install -y "${DEBS[@]}" \
             gnome-session-flashback \
             gnome-flashback \
@@ -353,7 +350,7 @@ jobs:
           MISSING=""
           for c in cp mv rm mkdir ls cat find grep sed awk tar gzip bzip2 xz zip unzip 7z bsdtar rsync \
                    nano git jq rg fd bat curl wget less file tree htop ncdu mc fzf zoxide tmux zenity \
-                   xfce4-terminal python3 google-chrome-stable cloudflared Xtigervnc Xvfb x11vnc code; do
+                   xfce4-terminal python3 google-chrome-stable cloudflared Xtigervnc Xvfb x11vnc code gh; do
             command -v "$c" >/dev/null || MISSING="$MISSING $c"
           done
           if [ -n "$MISSING" ]; then
@@ -364,7 +361,7 @@ jobs:
           echo "⏱ Installation finished after $(( $(date +%s) - $(cat /tmp/start-ts) )) seconds"
 
       # ------------------------------------------------------------------
-      # NEW: Antigravity IDE, Antigravity CLI (agy) and GitHub Copilot CLI (copilot).
+      # Antigravity IDE, Antigravity CLI (agy) and GitHub Copilot CLI (copilot).
       # Runs in the BACKGROUND so the desktop is not delayed. The launchers work as soon as it is done.
       # ------------------------------------------------------------------
       - name: Install Antigravity, Antigravity CLI & Copilot CLI (background)
@@ -984,7 +981,7 @@ jobs:
           openssl x509 -in "$CERT" -noout -subject -enddate -fingerprint -sha256
           openssl x509 -in "$CERT" -noout -checkend 0 || { echo "❌ Certificate has expired"; exit 1; }
 
-          # 1. Trust system-wide (curl, apt etc.)
+          # 1. Trust system-wide (curl, apt, git etc.)
           sudo cp "$CERT" /usr/local/share/ca-certificates/cloudflare-zt-root.crt
           sudo update-ca-certificates
 
@@ -996,6 +993,62 @@ jobs:
           certutil -d sql:$HOME/.pki/nssdb -L | grep "Cloudflare Zero Trust Root CA"
           rm -f "$CERT"
           echo "✅ Cloudflare Zero Trust Root CA installed."
+
+      # ------------------------------------------------------------------
+      # NEW: Git name/email + GitHub token from secrets.
+      # git clone/pull/push, gh and Copilot CLI work without ever pasting the token.
+      # ------------------------------------------------------------------
+      - name: Configure Git & GitHub login (from secrets)
+        env:
+          GIT_USER_NAME: ${{ secrets.GIT_USER_NAME }}
+          GIT_USER_EMAIL: ${{ secrets.GIT_USER_EMAIL }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -n "$GIT_USER_NAME" ]; then
+            git config --global user.name "$GIT_USER_NAME"
+          else
+            echo "⚠️ Secret GIT_USER_NAME is not set"
+          fi
+          if [ -n "$GIT_USER_EMAIL" ]; then
+            git config --global user.email "$GIT_USER_EMAIL"
+          else
+            echo "⚠️ Secret GIT_USER_EMAIL is not set"
+          fi
+          git config --global init.defaultBranch main
+          git config --global pull.rebase false
+          git config --global core.editor nano
+
+          if [ -z "$GH_PAT" ]; then
+            echo "⚠️ Secret GH_PAT is not set - git will ask for a login on push."
+            exit 0
+          fi
+
+          # The token is only stored in files that belong to this user (chmod 600) and is never printed
+          umask 077
+          mkdir -p ~/.config
+          printf '%s' "$GH_PAT" > ~/.config/gh-pat
+          GH_LOGIN=$(curl -fsS -H "Authorization: Bearer $GH_PAT" https://api.github.com/user | jq -r '.login // empty' || true)
+          if [ -z "$GH_LOGIN" ]; then
+            echo "⚠️ GH_PAT was rejected by GitHub (expired or wrong?). It is stored anyway."
+            GH_LOGIN="x-access-token"
+          else
+            echo "✅ GitHub token belongs to: $GH_LOGIN"
+          fi
+
+          # 1. git: credential store for https://github.com/... (no token prompt on push/pull)
+          printf 'https://%s:%s@github.com\n' "$GH_LOGIN" "$GH_PAT" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+          git config --global credential.helper store
+          git config --global credential.https://github.com.username "$GH_LOGIN"
+
+          # 2. GitHub CLI (gh) logged in with the same token
+          if command -v gh > /dev/null; then
+            (unset GH_TOKEN GITHUB_TOKEN; printf '%s' "$GH_PAT" | gh auth login --with-token --hostname github.com) \
+              && echo "✅ gh logged in" || echo "⚠️ gh login failed"
+          fi
+
+          # 3. Copilot CLI reads COPILOT_GITHUB_TOKEN (exported in ~/.bashrc, see next step)
+          echo "Git user: $(git config --global user.name) <$(git config --global user.email)>"
 
       - name: Configure Launchers & Desktop Session Script
         env:
@@ -1011,10 +1064,32 @@ jobs:
           echo "Default UI scale: $SCALE"
 
           # Chrome start script: reads the chosen scale, sharp grayscale text, no smooth scrolling.
-          # REMOVED: --disable-dev-shm-usage (it forced Chrome to use the slow disk instead of RAM = laggy)
+          # NEW: before Chrome starts, the page zoom is set to 125 % (Settings > Appearance > Page zoom)
+          #      and old Chrome lock files are removed.
           sudo tee /usr/local/bin/chrome-warp > /dev/null << 'EOF'
           #!/bin/bash
           SCALE=$(cat "$HOME/.config/desktop-scale" 2>/dev/null || echo 1)
+          PROFILE="$HOME/.config/google-chrome"
+          if ! pgrep -x chrome > /dev/null; then
+            rm -f "$PROFILE"/Singleton* 2>/dev/null
+            mkdir -p "$PROFILE/Default"
+            python3 - "$PROFILE/Default/Preferences" << 'PY'
+          import json, math, os, sys
+          path = sys.argv[1]
+          try:
+              with open(path) as f:
+                  prefs = json.load(f)
+          except Exception:
+              prefs = {}
+          # Chrome stores the zoom as a level: 125 % = log(1.25) / log(1.2)
+          level = math.log(1.25) / math.log(1.2)
+          prefs.setdefault("partition", {}).setdefault("default_zoom_level", {})["x"] = level
+          tmp = path + ".tmp"
+          with open(tmp, "w") as f:
+              json.dump(prefs, f)
+          os.replace(tmp, path)
+          PY
+          fi
           exec /usr/bin/google-chrome-stable \
             --proxy-server="socks5://127.0.0.1:1080" \
             --force-device-scale-factor="$SCALE" \
@@ -1028,14 +1103,14 @@ jobs:
           EOF
           sudo chmod +x /usr/local/bin/chrome-warp
 
-          # NEW: VS Code start script (no GPU in VNC = smoother, logins saved in the GNOME keyring)
+          # VS Code start script (no GPU in VNC = smoother, logins saved in the GNOME keyring)
           sudo tee /usr/local/bin/vscode-launch > /dev/null << 'EOF'
           #!/bin/bash
           exec /usr/bin/code --disable-gpu --password-store=gnome-libsecret "$@"
           EOF
           sudo chmod +x /usr/local/bin/vscode-launch
 
-          # NEW: Antigravity start script (waits politely if the background installation is not finished yet)
+          # Antigravity start script (waits politely if the background installation is not finished yet)
           sudo tee /usr/local/bin/antigravity-launch > /dev/null << 'EOF'
           #!/bin/bash
           for b in /usr/local/bin/antigravity /usr/bin/antigravity; do
@@ -1083,7 +1158,7 @@ jobs:
           MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
           EOF
 
-          # NEW: VS Code launcher
+          # VS Code launcher
           cat > ~/Desktop/vscode.desktop << 'EOF'
           [Desktop Entry]
           Version=1.0
@@ -1096,7 +1171,7 @@ jobs:
           Categories=Development;IDE;
           EOF
 
-          # NEW: Antigravity launcher
+          # Antigravity launcher
           cat > ~/Desktop/antigravity.desktop << 'EOF'
           [Desktop Entry]
           Version=1.0
@@ -1109,14 +1184,14 @@ jobs:
           Categories=Development;IDE;
           EOF
 
-          # NEW: AI terminal (shows how to start Copilot CLI and Antigravity CLI)
+          # AI terminal (shows how to start Copilot CLI and Antigravity CLI)
           cat > ~/Desktop/ai-terminal.desktop << 'EOF'
           [Desktop Entry]
           Version=1.0
           Type=Application
           Name=AI Terminal (copilot / agy)
           Comment=Terminal for GitHub Copilot CLI and Antigravity CLI
-          Exec=xfce4-terminal --geometry=110x30 --hide-menubar --hide-toolbar --title="AI Terminal" -x bash -c "echo 'GitHub Copilot CLI:  copilot   (first time: /login)'; echo 'Antigravity CLI:     agy       (first time: sign in with Google)'; echo; exec bash"
+          Exec=xfce4-terminal --geometry=110x30 --hide-menubar --hide-toolbar --title="AI Terminal" -x bash -c "echo 'GitHub Copilot CLI:  copilot'; echo 'Antigravity CLI:     agy       (first time: sign in with Google)'; echo; exec bash"
           Icon=utilities-terminal
           Terminal=false
           Categories=System;Development;
@@ -1189,7 +1264,7 @@ jobs:
           chmod +x ~/Desktop/*.desktop
           cp ~/Desktop/*.desktop ~/.local/share/applications/
 
-          # NEW: links and sign-in pages from VS Code / Antigravity / CLIs open in Chrome (WARP)
+          # Links and sign-in pages from VS Code / Antigravity / CLIs open in Chrome (WARP)
           xdg-mime default google-chrome.desktop x-scheme-handler/http x-scheme-handler/https text/html 2>/dev/null || true
           mkdir -p ~/.config
           cat > ~/.config/mimeapps.list << 'EOF'
@@ -1251,7 +1326,9 @@ jobs:
           alias du='du -h'
           alias free='free -h'
           alias drive='gdsh'
-          # NEW: open VS Code / Antigravity from the terminal, e.g. "code ." or "ag ."
+          # NEW: GitHub token from the GH_PAT secret for Copilot CLI (no /login needed)
+          [ -f "$HOME/.config/gh-pat" ] && export COPILOT_GITHUB_TOKEN="$(cat "$HOME/.config/gh-pat")"
+          # Open VS Code / Antigravity from the terminal, e.g. "code ." or "ag ."
           alias code='/usr/local/bin/vscode-launch'
           alias ag='/usr/local/bin/antigravity-launch'
           # Unpack almost any archive: x file.zip / file.tar.gz / file.7z / file.rar
@@ -1508,8 +1585,8 @@ jobs:
           fi
           echo "Total time so far: $(( $(date +%s) - $(cat /tmp/start-ts) )) seconds."
 
-      # NEW: only shows the result. The desktop is already usable, nothing waits for this step.
-      - name: Check VS Code, Antigravity, Antigravity CLI & Copilot CLI
+      # Only shows the result. The desktop is already usable, nothing waits for this step.
+      - name: Check VS Code, Antigravity, Antigravity CLI, Copilot CLI & Git
         run: |
           for i in $(seq 1 100); do
             [ -f /tmp/devtools.done ] && break
@@ -1527,6 +1604,8 @@ jobs:
           fi
           echo "Antigravity CLI:  $(command -v agy >/dev/null && (agy --version 2>/dev/null | head -1 || echo installed) || echo '⚠️ missing')"
           echo "Copilot CLI:      $(command -v copilot >/dev/null && (copilot --version 2>/dev/null | head -1 || echo installed) || echo '⚠️ missing')"
+          echo "Git user:         $(git config --global user.name) <$(git config --global user.email)>"
+          [ -f ~/.git-credentials ] && echo "GitHub token:     stored for git, gh and Copilot CLI" || echo "GitHub token:     ⚠️ not stored"
 
       - name: Keep Alive (starts the next desktop early, then ends)
         env:
@@ -1546,7 +1625,7 @@ jobs:
 
           # Timeline (counted from the start of this job):
           #   minute 315: start the NEXT desktop (it builds itself and waits for the handover)
-          #   minute 335: this run ends, the next desktop takes over the tunnel within seconds
+          #   minute 335: this run ends, the next desktop takes over within seconds
           START=$(cat /tmp/start-ts)
           HANDOVER_AT=$((START + 315 * 60))
           END_AT=$((START + 335 * 60))
@@ -1587,3 +1666,4 @@ jobs:
           done
 
           echo "This run ends now - the next run has taken over or will do so shortly."
+
