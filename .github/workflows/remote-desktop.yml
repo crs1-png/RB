@@ -31,6 +31,12 @@ jobs:
     runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     timeout-minutes: 350   # hard limit of GitHub Actions is 360 min
 
+    # Timeline of one desktop (minutes counted from the start of the job).
+    # The on-screen countdown (bottom right) uses exactly the same values.
+    env:
+      HANDOVER_MINUTES: 315   # the next desktop is started and prepares itself
+      SESSION_MINUTES: 335    # this desktop ends, the next one takes over
+
     steps:
       # ------------------------------------------------------------------
       # Cron safety net: only start a new desktop if no other run is active.
@@ -169,7 +175,10 @@ jobs:
             curl -s --max-time 15 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -E "warp=|gateway=" || echo "⚠️ Test failed (certificate may not match)"
           else
             echo "⚠️ WARP is NOT connected. Chrome will not load pages (no data leak)."
-            docker exec warp-proxy tail -n 50 /var/log/warp-svc.log || true
+            # PRIVACY: the service log can contain account and device details.
+            # It stays on the remote computer and is NOT printed into the (public) GitHub log.
+            docker exec warp-proxy tail -n 50 /var/log/warp-svc.log > /tmp/warp-svc-tail.log 2>&1 || true
+            echo "Details only on the remote computer: /tmp/warp-svc-tail.log"
           fi
           touch /tmp/warp.done
           WARPSCRIPT
@@ -253,6 +262,7 @@ jobs:
             python3 \
             python3-gi \
             gir1.2-glib-2.0 \
+            gir1.2-gtk-3.0 \
             zip \
             unzip \
             p7zip-full \
@@ -350,7 +360,7 @@ jobs:
           MISSING=""
           for c in cp mv rm mkdir ls cat find grep sed awk tar gzip bzip2 xz zip unzip 7z bsdtar rsync \
                    nano git jq rg fd bat curl wget less file tree htop ncdu mc fzf zoxide tmux zenity \
-                   xfce4-terminal python3 google-chrome-stable cloudflared Xtigervnc Xvfb x11vnc code gh; do
+                   xfce4-terminal python3 google-chrome-stable cloudflared Xtigervnc Xvfb x11vnc xprop code gh; do
             command -v "$c" >/dev/null || MISSING="$MISSING $c"
           done
           if [ -n "$MISSING" ]; then
@@ -977,9 +987,9 @@ jobs:
             echo "❌ ERROR: The secret content is not a valid certificate!"
             exit 1
           fi
-          echo "Certificate:"
-          openssl x509 -in "$CERT" -noout -subject -enddate -fingerprint -sha256
-          openssl x509 -in "$CERT" -noout -checkend 0 || { echo "❌ Certificate has expired"; exit 1; }
+          # PRIVACY: only the expiry date is printed (subject and fingerprint can identify your Cloudflare account)
+          echo "Certificate $(openssl x509 -in "$CERT" -noout -enddate)"
+          openssl x509 -in "$CERT" -noout -checkend 0 > /dev/null || { echo "❌ Certificate has expired"; exit 1; }
 
           # 1. Trust system-wide (curl, apt, git etc.)
           sudo cp "$CERT" /usr/local/share/ca-certificates/cloudflare-zt-root.crt
@@ -990,12 +1000,12 @@ jobs:
           [ -f ~/.pki/nssdb/cert9.db ] || certutil -d sql:$HOME/.pki/nssdb -N --empty-password
           certutil -d sql:$HOME/.pki/nssdb -D -n "Cloudflare Zero Trust Root CA" 2>/dev/null || true
           certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "Cloudflare Zero Trust Root CA" -i "$CERT"
-          certutil -d sql:$HOME/.pki/nssdb -L | grep "Cloudflare Zero Trust Root CA"
+          certutil -d sql:$HOME/.pki/nssdb -L | grep -q "Cloudflare Zero Trust Root CA"
           rm -f "$CERT"
           echo "✅ Cloudflare Zero Trust Root CA installed."
 
       # ------------------------------------------------------------------
-      # NEW: Git name/email + GitHub token from secrets.
+      # Git name/email + GitHub token from secrets.
       # git clone/pull/push, gh and Copilot CLI work without ever pasting the token.
       # ------------------------------------------------------------------
       - name: Configure Git & GitHub login (from secrets)
@@ -1032,7 +1042,9 @@ jobs:
             echo "⚠️ GH_PAT was rejected by GitHub (expired or wrong?). It is stored anyway."
             GH_LOGIN="x-access-token"
           else
-            echo "✅ GitHub token belongs to: $GH_LOGIN"
+            # PRIVACY: hide the GitHub user name in all following log lines (public repo safe)
+            echo "::add-mask::$GH_LOGIN"
+            echo "✅ GitHub token is valid"
           fi
 
           # 1. git: credential store for https://github.com/... (no token prompt on push/pull)
@@ -1047,8 +1059,105 @@ jobs:
               && echo "✅ gh logged in" || echo "⚠️ gh login failed"
           fi
 
-          # 3. Copilot CLI reads COPILOT_GITHUB_TOKEN (exported in ~/.bashrc, see next step)
-          echo "Git user: $(git config --global user.name) <$(git config --global user.email)>"
+          # 3. Copilot CLI reads COPILOT_GITHUB_TOKEN (exported in ~/.bashrc, see launcher step)
+          # PRIVACY: only "set / not set" is printed, never the name or e-mail
+          echo "Git user name:  $([ -n "$(git config --global user.name)" ] && echo set || echo 'not set')"
+          echo "Git user email: $([ -n "$(git config --global user.email)" ] && echo set || echo 'not set')"
+
+      # ------------------------------------------------------------------
+      # NEW: Clone your repositories into ~/Downloads (in the BACKGROUND, desktop is usable meanwhile).
+      # The list comes from the secret CLONE_REPOS (one repository URL per line).
+      # PRIVACY: repository names and URLs are NEVER written to the GitHub log.
+      # Details only go to /tmp/repo-clone.log on the remote computer.
+      # ------------------------------------------------------------------
+      - name: Clone repositories into Downloads (background, list from secret)
+        env:
+          CLONE_REPOS: ${{ secrets.CLONE_REPOS }}
+        run: |
+          rm -f /tmp/repos.done
+          : > /tmp/repos.result
+          if [ -z "$CLONE_REPOS" ]; then
+            echo "ℹ️ Secret CLONE_REPOS is not set - no repositories are cloned."
+            touch /tmp/repos.done
+            exit 0
+          fi
+
+          umask 077
+          mkdir -p ~/.config ~/Downloads
+          printf '%s\n' "$CLONE_REPOS" > ~/.config/clone-repos.list
+          COUNT=$(grep -cvE '^[[:space:]]*(#|$)' ~/.config/clone-repos.list || true)
+          echo "${COUNT:-0} repositories listed - cloning in the background into ~/Downloads."
+
+          cat > ~/clone-repos.sh << 'CLONESCRIPT'
+          #!/bin/bash
+          umask 077
+          exec > /tmp/repo-clone.log 2>&1
+          umask 022
+          export GIT_TERMINAL_PROMPT=0
+          LIST="$HOME/.config/clone-repos.list"
+          DEST="$HOME/Downloads"
+          RESULT=/tmp/repos.result
+          mkdir -p "$DEST"
+          declare -A USED
+
+          clone_one() {
+            local slug="$1" target="$2"
+            for TRY in 1 2 3; do
+              # blob:none = full history, file contents are loaded on demand (much faster for big repos)
+              if git clone --filter=blob:none "https://github.com/$slug.git" "$target"; then
+                echo "✅ $slug -> $target"
+                echo ok >> "$RESULT"
+                return 0
+              fi
+              rm -rf "$target"
+              echo "Attempt $TRY for $slug failed, retrying ..."
+              sleep $((TRY * 3))
+            done
+            echo "❌ $slug could not be cloned (no access with GH_PAT or wrong name?)"
+            echo failed >> "$RESULT"
+          }
+
+          while IFS= read -r line || [ -n "$line" ]; do
+            url=$(printf '%s' "$line" | tr -d '\r' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+            case "$url" in ''|'#'*) continue ;; esac
+            # Accepts https://github.com/owner/repo, .../repo.git, github.com/owner/repo, git@github.com:owner/repo, owner/repo
+            slug="${url%/}"
+            slug="${slug%.git}"
+            slug="${slug#https://}"; slug="${slug#http://}"; slug="${slug#git@github.com:}"
+            slug="${slug#www.}"; slug="${slug#github.com/}"
+            owner="${slug%%/*}"; name="${slug#*/}"
+            if ! [[ "$slug" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [ "$name" = "." ] || [ "$name" = ".." ]; then
+              echo "❌ skipped, not a GitHub repository URL: $url"
+              echo failed >> "$RESULT"
+              continue
+            fi
+            dir="$name"
+            [ -n "${USED[$dir]}" ] && dir="$owner-$name"   # same repo name from two owners
+            USED[$dir]=1
+            target="$DEST/$dir"
+            if [ -d "$target/.git" ]; then
+              echo "Already there, updating: $target"
+              if git -C "$target" pull --ff-only; then echo ok >> "$RESULT"; else echo failed >> "$RESULT"; fi
+              continue
+            fi
+            if [ -e "$target" ]; then
+              echo "❌ skipped, folder already exists: $target"
+              echo failed >> "$RESULT"
+              continue
+            fi
+            clone_one "$slug" "$target" &
+            # at most 3 clones at the same time
+            while [ "$(jobs -rp | wc -l)" -ge 3 ]; do sleep 0.5; done
+          done < "$LIST"
+          wait
+          rm -f "$LIST"   # the list is not needed any more
+          echo "Finished: $(grep -c '^ok' "$RESULT") ok, $(grep -c '^failed' "$RESULT") failed"
+          touch /tmp/repos.done
+          CLONESCRIPT
+          chmod 700 ~/clone-repos.sh
+
+          nohup setsid bash ~/clone-repos.sh > /dev/null 2>&1 &
+          echo "Cloning runs in the background (details only on the remote computer: /tmp/repo-clone.log)"
 
       - name: Configure Launchers & Desktop Session Script
         env:
@@ -1063,9 +1172,14 @@ jobs:
           echo "$SCALE" > ~/.config/desktop-scale
           echo "Default UI scale: $SCALE"
 
+          # NEW: times for the on-screen countdown (same values as the Keep Alive step)
+          START=$(cat /tmp/start-ts)
+          echo $((START + SESSION_MINUTES * 60)) > /tmp/runner-end-ts
+          echo $((START + HANDOVER_MINUTES * 60)) > /tmp/runner-handover-ts
+
           # Chrome start script: reads the chosen scale, sharp grayscale text, no smooth scrolling.
-          # NEW: before Chrome starts, the page zoom is set to 125 % (Settings > Appearance > Page zoom)
-          #      and old Chrome lock files are removed.
+          # Before Chrome starts, the page zoom is set to 125 % (Settings > Appearance > Page zoom)
+          # and old Chrome lock files are removed.
           sudo tee /usr/local/bin/chrome-warp > /dev/null << 'EOF'
           #!/bin/bash
           SCALE=$(cat "$HOME/.config/desktop-scale" 2>/dev/null || echo 1)
@@ -1143,6 +1257,228 @@ jobs:
           [ -z "$1" ] && zenity --info --width=320 --text="Done. Please close and reopen Chrome to apply it there." || true
           EOF
           sudo chmod +x /usr/local/bin/desktop-scale
+
+          # ------------------------------------------------------------------
+          # NEW: Runner clock (bottom right, directly above the bottom panel)
+          #  - big:   current GERMAN time (Europe/Berlin, switches CET/CEST automatically)
+          #  - small: time left until this runner shuts down + end time
+          #  The system time zone and region are NOT changed (stay UTC / en_US).
+          #  Colours: green > 60 min, yellow <= 60 min, red <= 15 min. Hover = details.
+          # ------------------------------------------------------------------
+          sudo tee /usr/local/bin/runner-clock > /dev/null << 'EOF'
+          #!/usr/bin/python3
+          """runner-clock - German time and the time left until this runner shuts down."""
+          import datetime as dt
+          import re
+          import subprocess
+          import time
+
+          import gi
+          gi.require_version("Gtk", "3.0")
+          gi.require_version("Gdk", "3.0")
+          gi.require_version("GdkX11", "3.0")
+          from gi.repository import Gdk, GdkX11, GLib, Gtk  # noqa: F401  (GdkX11 provides get_xid)
+
+          try:
+              from zoneinfo import ZoneInfo
+              BERLIN = ZoneInfo("Europe/Berlin")
+          except Exception:
+              BERLIN = None
+
+          END_FILE = "/tmp/runner-end-ts"
+          HANDOVER_FILE = "/tmp/runner-handover-ts"
+
+          CSS = b"""
+          #rc { background-color: #202124; }
+          #rc-left { font-size: 8pt; color: #9aa0a6; }
+          #rc-time { font-family: "DejaVu Sans Mono", monospace; font-size: 12pt; font-weight: bold; color: #e8eaed; }
+          #rc-left.ok { color: #81c995; }
+          #rc-left.warn { color: #fdd663; }
+          #rc-left.crit { color: #f28b82; }
+          """
+
+
+          def last_sunday(year, month):
+              day = dt.date(year, month, 31)  # March and October both have 31 days
+              return day - dt.timedelta(days=(day.weekday() + 1) % 7)
+
+
+          def german_time(ts):
+              utc = dt.datetime.fromtimestamp(ts, dt.timezone.utc)
+              if BERLIN is not None:
+                  local = utc.astimezone(BERLIN)
+                  return local, local.tzname()
+              # Fallback without time zone database: EU summer time rule
+              begin = dt.datetime.combine(last_sunday(utc.year, 3), dt.time(1), dt.timezone.utc)
+              end = dt.datetime.combine(last_sunday(utc.year, 10), dt.time(1), dt.timezone.utc)
+              if begin <= utc < end:
+                  return utc + dt.timedelta(hours=2), "CEST"
+              return utc + dt.timedelta(hours=1), "CET"
+
+
+          def read_ts(path):
+              try:
+                  with open(path) as f:
+                      return int(f.read().strip())
+              except (OSError, ValueError):
+                  return None
+
+
+          def fmt_left(sec):
+              if sec >= 3600:
+                  return f"{sec // 3600} h {sec % 3600 // 60:02d} min"
+              if sec >= 600:
+                  return f"{sec // 60} min"
+              return f"{sec // 60}:{sec % 60:02d} min"
+
+
+          def xprop(*args):
+              try:
+                  return subprocess.run(["xprop", *args], capture_output=True, text=True, timeout=3).stdout
+              except Exception:
+                  return ""
+
+
+          def reserved_bottom(own_xid):
+              """Height that other docks (the GNOME bottom panel) reserve at the bottom of the screen."""
+              best = 0
+              for wid in re.findall(r"0x[0-9a-fA-F]+", xprop("-root", "_NET_CLIENT_LIST")):
+                  if int(wid, 16) == own_xid:
+                      continue
+                  out = xprop("-id", wid, "_NET_WM_STRUT_PARTIAL")
+                  if "=" not in out:
+                      continue
+                  nums = [int(n) for n in re.findall(r"\d+", out.split("=", 1)[1])]
+                  if len(nums) >= 4:
+                      best = max(best, nums[3])
+              return best
+
+
+          def set_strut(xid, bottom, x0, x1):
+              """Reserve space so maximized windows end above the clock (nothing gets covered)."""
+              wid = hex(xid)
+              try:
+                  subprocess.run(["xprop", "-id", wid, "-f", "_NET_WM_STRUT_PARTIAL", "32c", "-set",
+                                  "_NET_WM_STRUT_PARTIAL", f"0, 0, 0, {bottom}, 0, 0, 0, 0, 0, 0, {x0}, {x1}"],
+                                 capture_output=True, timeout=3)
+                  subprocess.run(["xprop", "-id", wid, "-f", "_NET_WM_STRUT", "32c", "-set",
+                                  "_NET_WM_STRUT", f"0, 0, 0, {bottom}"], capture_output=True, timeout=3)
+              except Exception:
+                  pass
+
+
+          class RunnerClock(Gtk.Window):
+              def __init__(self):
+                  super().__init__(title="Runner clock")
+                  self.set_name("rc")
+                  self.set_type_hint(Gdk.WindowTypeHint.DOCK)
+                  self.set_decorated(False)
+                  self.set_resizable(False)
+                  self.set_skip_taskbar_hint(True)
+                  self.set_skip_pager_hint(True)
+                  self.set_keep_above(True)
+                  self.set_accept_focus(False)
+                  self.stick()
+
+                  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+                  box.set_margin_start(12)
+                  box.set_margin_end(12)
+                  box.set_margin_top(3)
+                  box.set_margin_bottom(3)
+                  self.left = Gtk.Label(xalign=1.0)
+                  self.left.set_name("rc-left")
+                  self.clock = Gtk.Label(xalign=1.0)
+                  self.clock.set_name("rc-time")
+                  box.pack_start(self.left, False, False, 0)
+                  box.pack_start(self.clock, False, False, 0)
+                  self.add(box)
+
+                  self.geo = None
+                  self.strut = None
+                  self.panel = 0
+                  self.scanned = 0.0
+                  self.tip = ""
+                  self.connect("destroy", Gtk.main_quit)
+                  self.update()
+                  self.show_all()
+
+                  screen = Gdk.Screen.get_default()
+                  screen.connect("size-changed", lambda *_: self.place(True))
+                  screen.connect("monitors-changed", lambda *_: self.place(True))
+                  GLib.timeout_add(500, self.update)
+                  GLib.timeout_add(2000, self.place)
+                  self.place(True)
+
+              def update(self):
+                  now = time.time()
+                  local, tz = german_time(now)
+                  self.clock.set_text(f"{local:%H:%M:%S} {tz}")
+                  ctx = self.left.get_style_context()
+                  for c in ("ok", "warn", "crit"):
+                      ctx.remove_class(c)
+                  end = read_ts(END_FILE)
+                  if end is None:
+                      self.left.set_text("Runner: time left unknown")
+                      return True
+                  left = int(end - now)
+                  end_local, end_tz = german_time(end)
+                  if left > 0:
+                      self.left.set_text(f"Runner: {fmt_left(left)} left (ends {end_local:%H:%M})")
+                      ctx.add_class("ok" if left > 3600 else "warn" if left > 900 else "crit")
+                  else:
+                      self.left.set_text("Runner ending - new desktop takes over")
+                      ctx.add_class("crit")
+                  tip = (f"German time (Europe/Berlin). The system time zone is not changed.\n"
+                         f"This desktop ends at {end_local:%H:%M} {end_tz}.")
+                  hand = read_ts(HANDOVER_FILE)
+                  if hand:
+                      tip += f"\nThe next desktop starts preparing at {german_time(hand)[0]:%H:%M}."
+                  tip += "\nPush or save your work before the end - local files are not carried over."
+                  if tip != self.tip:
+                      self.set_tooltip_text(tip)
+                      self.tip = tip
+                  return True
+
+              def place(self, rescan=False):
+                  win = self.get_window()
+                  display = Gdk.Display.get_default()
+                  mon = display.get_primary_monitor() or display.get_monitor(0) if display else None
+                  if win is None or mon is None:
+                      return True
+                  g = mon.get_geometry()
+                  xid = win.get_xid()
+                  if rescan or time.monotonic() - self.scanned > 10:
+                      self.panel = reserved_bottom(xid)
+                      self.scanned = time.monotonic()
+                  nat = self.get_preferred_size()[1]
+                  w, h = nat.width, nat.height
+                  x = g.x + g.width - w
+                  y = g.y + g.height - self.panel - h
+                  if (x, y, w, h) != self.geo:
+                      self.resize(w, h)
+                      self.move(x, y)
+                      self.geo = (x, y, w, h)
+                  strut = (self.panel + h, x, g.x + g.width - 1)
+                  if strut != self.strut:
+                      set_strut(xid, *strut)
+                      self.strut = strut
+                  return True
+
+
+          def main():
+              provider = Gtk.CssProvider()
+              provider.load_from_data(CSS)
+              Gtk.StyleContext.add_provider_for_screen(
+                  Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+              RunnerClock()
+              Gtk.main()
+
+
+          if __name__ == "__main__":
+              main()
+          EOF
+          sudo chmod +x /usr/local/bin/runner-clock
+          python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" /usr/local/bin/runner-clock && echo "✅ runner-clock installed"
 
           # Chrome launcher (routed through the WARP SOCKS5 proxy)
           cat > ~/Desktop/google-chrome.desktop << 'EOF'
@@ -1326,7 +1662,7 @@ jobs:
           alias du='du -h'
           alias free='free -h'
           alias drive='gdsh'
-          # NEW: GitHub token from the GH_PAT secret for Copilot CLI (no /login needed)
+          # GitHub token from the GH_PAT secret for Copilot CLI (no /login needed)
           [ -f "$HOME/.config/gh-pat" ] && export COPILOT_GITHUB_TOKEN="$(cat "$HOME/.config/gh-pat")"
           # Open VS Code / Antigravity from the terminal, e.g. "code ." or "ag ."
           alias code='/usr/local/bin/vscode-launch'
@@ -1434,6 +1770,11 @@ jobs:
             start_if_missing metacity metacity --replace
             start_if_missing gnome-flashback gnome-flashback
             start_if_missing gnome-panel gnome-panel
+            # NEW: German time + runner countdown (bottom right)
+            if ! pgrep -u "$(id -u)" -f /usr/local/bin/runner-clock >/dev/null; then
+              echo "$(date '+%H:%M:%S') starting runner-clock"
+              /usr/local/bin/runner-clock >> /tmp/desktop-runner-clock.log 2>&1 &
+            fi
             sleep 5
           done
           EOF
@@ -1558,6 +1899,7 @@ jobs:
           pgrep -a -x gnome-flashback || echo "⚠️ gnome-flashback is not running"
           pgrep -a -x gnome-panel || echo "⚠️ gnome-panel is not running"
           pgrep -a -x gsd-xsettings || echo "⚠️ gsd-xsettings is not running (fonts/scale may look different)"
+          pgrep -f /usr/local/bin/runner-clock >/dev/null && echo "runner-clock is running" || echo "⚠️ runner-clock is not running (see /tmp/desktop-runner-clock.log)"
 
           echo "=========================================="
           echo "✅ GNOME Remote Desktop is running and reachable via Cloudflare Zero Trust."
@@ -1586,7 +1928,7 @@ jobs:
           echo "Total time so far: $(( $(date +%s) - $(cat /tmp/start-ts) )) seconds."
 
       # Only shows the result. The desktop is already usable, nothing waits for this step.
-      - name: Check VS Code, Antigravity, Antigravity CLI, Copilot CLI & Git
+      - name: Check VS Code, Antigravity, Antigravity CLI, Copilot CLI, Git & Repositories
         run: |
           for i in $(seq 1 100); do
             [ -f /tmp/devtools.done ] && break
@@ -1604,8 +1946,15 @@ jobs:
           fi
           echo "Antigravity CLI:  $(command -v agy >/dev/null && (agy --version 2>/dev/null | head -1 || echo installed) || echo '⚠️ missing')"
           echo "Copilot CLI:      $(command -v copilot >/dev/null && (copilot --version 2>/dev/null | head -1 || echo installed) || echo '⚠️ missing')"
-          echo "Git user:         $(git config --global user.name) <$(git config --global user.email)>"
+          # PRIVACY: only "set / not set", never the name or e-mail
+          echo "Git user:         name $([ -n "$(git config --global user.name)" ] && echo set || echo 'NOT set'), email $([ -n "$(git config --global user.email)" ] && echo set || echo 'NOT set')"
           [ -f ~/.git-credentials ] && echo "GitHub token:     stored for git, gh and Copilot CLI" || echo "GitHub token:     ⚠️ not stored"
+          # PRIVACY: only counts, never repository names
+          if [ -f /tmp/repos.done ]; then
+            echo "Repositories:     $(grep -c '^ok' /tmp/repos.result 2>/dev/null) ok, $(grep -c '^failed' /tmp/repos.result 2>/dev/null) failed (details on the remote computer: /tmp/repo-clone.log)"
+          else
+            echo "Repositories:     still cloning in the background (so far $(grep -c '^ok' /tmp/repos.result 2>/dev/null) ok)"
+          fi
 
       - name: Keep Alive (starts the next desktop early, then ends)
         env:
@@ -1623,12 +1972,12 @@ jobs:
             echo "Load: $(cut -d' ' -f1-3 /proc/loadavg) | Free RAM: $(free -m | awk '/Mem:/ {print $7}') MB"
           }
 
-          # Timeline (counted from the start of this job):
-          #   minute 315: start the NEXT desktop (it builds itself and waits for the handover)
-          #   minute 335: this run ends, the next desktop takes over within seconds
+          # Timeline (counted from the start of this job, values from the job "env" at the top):
+          #   minute HANDOVER_MINUTES (315): start the NEXT desktop (it builds itself and waits for the handover)
+          #   minute SESSION_MINUTES  (335): this run ends, the next desktop takes over within seconds
           START=$(cat /tmp/start-ts)
-          HANDOVER_AT=$((START + 315 * 60))
-          END_AT=$((START + 335 * 60))
+          HANDOVER_AT=$((START + HANDOVER_MINUTES * 60))
+          END_AT=$((START + SESSION_MINUTES * 60))
 
           echo "Desktop active. The successor starts in $(( (HANDOVER_AT - $(date +%s)) / 60 )) minutes."
           N=0
@@ -1666,4 +2015,3 @@ jobs:
           done
 
           echo "This run ends now - the next run has taken over or will do so shortly."
-
