@@ -213,6 +213,12 @@ jobs:
             PIDS+=($!)
             DEBS+=(/tmp/dl/google-chrome-stable_current_amd64.deb)
           fi
+          # NEW: Go (latest stable version from go.dev), downloaded in parallel. A failure here does not stop the desktop.
+          (
+            GO_VER=$(curl -fsSL "https://go.dev/dl/?mode=json" | jq -r '[.[] | select(.stable)][0].version' 2>/dev/null)
+            [ -n "$GO_VER" ] && [ "$GO_VER" != "null" ] && curl -fsSL -o /tmp/dl/go.tar.gz "https://go.dev/dl/${GO_VER}.linux-amd64.tar.gz"
+          ) &
+          GO_PID=$!
           sudo apt-get update
           for p in "${PIDS[@]}"; do
             wait "$p" || { echo "❌ Download failed"; exit 1; }
@@ -220,6 +226,7 @@ jobs:
           chmod 644 /tmp/dl/*.deb
 
           # Everything in ONE apt call. Tools already on the runner are skipped by apt.
+          # NEW: tzdata (world clock time zones) and xbindkeys (Windows-like app shortcuts)
           sudo apt-get install -y "${DEBS[@]}" \
             gnome-session-flashback \
             gnome-flashback \
@@ -278,10 +285,21 @@ jobs:
             lsof \
             psmisc \
             xclip \
+            xbindkeys \
+            tzdata \
             libsecret-1-0 \
             libsecret-tools \
             desktop-file-utils \
             xdg-utils
+          # NEW: install Go into /usr/local/go (official layout) and make it available everywhere
+          if wait "$GO_PID" && [ -s /tmp/dl/go.tar.gz ]; then
+            sudo rm -rf /usr/local/go
+            sudo tar -C /usr/local -xzf /tmp/dl/go.tar.gz
+            for b in go gofmt; do sudo ln -sf "/usr/local/go/bin/$b" "/usr/local/bin/$b"; done
+            echo "✅ $(/usr/local/go/bin/go version)"
+          else
+            echo "⚠️ Go could not be downloaded"
+          fi
           rm -rf /tmp/dl
 
           # Ubuntu names some tools differently: make "fd" and "bat" work as usual
@@ -356,11 +374,147 @@ jobs:
           </html>
           EOF
 
+          # ------------------------------------------------------------------
+          # NEW: Windows shortcuts go to the REMOTE desktop (Keyboard Lock).
+          #  - F11 (or the full screen button in the noVNC side bar) opens a special full screen
+          #    in which Chrome / Edge pass Alt+Tab, Win+Tab, the Windows key, Alt+F4, Esc ...
+          #    to the remote desktop instead of to Windows.
+          #  - Leave full screen: F11 again, or press and HOLD Esc.
+          #  - Only Chromium browsers (Chrome, Edge) support this. Ctrl+Alt+Del and Win+L always stay on Windows.
+          #  - The first time, the browser asks for permission to control the keyboard: choose "Allow".
+          #  The script is written inline into vnc.html (no separate .js file = no Cloudflare caching problems).
+          # ------------------------------------------------------------------
+          cat > /tmp/novnc-keyboard-lock.js << 'EOF'
+          (function () {
+            if (window.__rdKeyboardLock) { return; }
+            window.__rdKeyboardLock = true;
+            var supported = !!(navigator.keyboard && navigator.keyboard.lock);
+            var locked = false;
+            var busy = false;
+
+            var toast = document.createElement('div');
+            toast.style.cssText = 'position:fixed;left:50%;top:14px;transform:translateX(-50%);z-index:2147483647;' +
+              'background:rgba(32,33,36,.94);color:#e8eaed;font:14px/1.4 system-ui,sans-serif;padding:10px 16px;' +
+              'border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,.5);pointer-events:none;display:none;' +
+              'max-width:90vw;text-align:center';
+            document.body.appendChild(toast);
+            var timer = null;
+            function show(msg, ms) {
+              toast.textContent = msg;
+              toast.style.display = 'block';
+              clearTimeout(timer);
+              timer = setTimeout(function () { toast.style.display = 'none'; }, ms || 5000);
+            }
+
+            function isFs() { return !!(document.fullscreenElement || document.webkitFullscreenElement); }
+
+            // lock() is called directly in the key press / click, so the browser accepts it
+            // (it needs a user action). The lock becomes active as soon as the page is in full screen.
+            function lockKeys() {
+              if (!supported || locked || busy) { return; }
+              busy = true;
+              navigator.keyboard.lock().then(function () {
+                locked = true;
+                busy = false;
+                if (isFs()) { announce(); }
+              }).catch(function () {
+                busy = false;
+                show('Keyboard control was not allowed. Click the icon left of the address bar, ' +
+                     'allow keyboard control for this site and press F11 again.', 9000);
+              });
+            }
+
+            function announce() {
+              show('Windows shortcuts (Alt+Tab, Win+Tab, Win key, Alt+F4 ...) now work on the remote desktop. ' +
+                   'Leave full screen: F11 or hold Esc.', 6000);
+            }
+
+            function toggle() {
+              if (isFs()) {
+                if (document.exitFullscreen) { document.exitFullscreen(); }
+                return;
+              }
+              lockKeys();
+              var el = document.documentElement;
+              var p = el.requestFullscreen ? el.requestFullscreen({ navigationUI: 'hide' }) : null;
+              if (p && p.catch) {
+                p.catch(function () { show('Full screen was blocked by the browser. Click into the page and press F11 again.', 6000); });
+              }
+            }
+
+            document.addEventListener('fullscreenchange', function () {
+              if (isFs()) {
+                if (!supported) {
+                  show('This browser cannot pass Windows shortcuts on. Please use Google Chrome or Microsoft Edge.', 7000);
+                } else if (locked) {
+                  announce();
+                } else {
+                  lockKeys();
+                }
+              } else if (supported && locked) {
+                navigator.keyboard.unlock();
+                locked = false;
+              }
+            });
+
+            // F11 = full screen WITH keyboard lock (the normal browser F11 full screen cannot lock keys)
+            window.addEventListener('keydown', function (e) {
+              if (e.code === 'F11' || e.key === 'F11') {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                if (!e.repeat) { toggle(); }
+              }
+            }, true);
+            window.addEventListener('keyup', function (e) {
+              if (e.code === 'F11' || e.key === 'F11') {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+              }
+            }, true);
+
+            // The full screen button in the noVNC side bar also locks the keyboard
+            document.addEventListener('click', function (e) {
+              if (e.target && e.target.closest && e.target.closest('#noVNC_fullscreen_button') && !isFs()) {
+                lockKeys();
+              }
+            }, true);
+
+            setTimeout(function () {
+              if (!isFs()) {
+                show(supported
+                  ? 'Tip: press F11 for full screen - then Alt+Tab, Win+Tab and the Windows key work on the remote desktop.'
+                  : 'Tip: open this page in Chrome or Edge to use Windows shortcuts on the remote desktop.', 6000);
+              }
+            }, 1500);
+          })();
+          EOF
+          sudo python3 - /usr/share/novnc/vnc.html /tmp/novnc-keyboard-lock.js << 'PY'
+          import sys
+          page, js_file = sys.argv[1], sys.argv[2]
+          with open(page, encoding="utf-8") as f:
+              html = f.read()
+          with open(js_file, encoding="utf-8") as f:
+              js = f.read()
+          marker = "<!-- remote-desktop-keyboard-lock -->"
+          if marker in html:
+              print("Keyboard lock already in vnc.html")
+              sys.exit(0)
+          block = marker + "\n<script>\n" + js + "\n</script>\n"
+          if "</body>" in html:
+              html = html.replace("</body>", block + "</body>", 1)
+          else:
+              html += "\n" + block
+          with open(page, "w", encoding="utf-8") as f:
+              f.write(html)
+          print("✅ Keyboard lock (Windows shortcuts in full screen) added to vnc.html")
+          PY
+          rm -f /tmp/novnc-keyboard-lock.js
+
           # Check that the important commands really exist
           MISSING=""
           for c in cp mv rm mkdir ls cat find grep sed awk tar gzip bzip2 xz zip unzip 7z bsdtar rsync \
                    nano git jq rg fd bat curl wget less file tree htop ncdu mc fzf zoxide tmux zenity \
-                   xfce4-terminal python3 google-chrome-stable cloudflared Xtigervnc Xvfb x11vnc xprop code gh; do
+                   xfce4-terminal python3 google-chrome-stable cloudflared Xtigervnc Xvfb x11vnc xprop xmodmap xbindkeys code gh go; do
             command -v "$c" >/dev/null || MISSING="$MISSING $c"
           done
           if [ -n "$MISSING" ]; then
@@ -374,7 +528,7 @@ jobs:
       # Antigravity IDE, Antigravity CLI (agy) and GitHub Copilot CLI (copilot).
       # Runs in the BACKGROUND so the desktop is not delayed. The launchers work as soon as it is done.
       # ------------------------------------------------------------------
-      - name: Install Antigravity, Antigravity CLI & Copilot CLI (background)
+      - name: Install Antigravity, Antigravity CLI, Copilot CLI & Go tools (background)
         run: |
           # Electron apps (VS Code, Antigravity) need user namespaces for their sandbox.
           # Ubuntu 24.04 blocks them by default via AppArmor -> apps would not open.
@@ -474,12 +628,25 @@ jobs:
           fi
           [ "$IDE_OK" = "1" ] || echo "⚠️ Antigravity IDE could not be installed"
 
+          # ---------- 4. Go tools (language server, debugger) + VS Code Go extension ----------
+          echo "== Go tools =="
+          export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH"
+          if command -v go > /dev/null; then
+            go install golang.org/x/tools/gopls@latest && echo "✅ gopls" || echo "⚠️ gopls not installed"
+            go install github.com/go-delve/delve/cmd/dlv@latest && echo "✅ dlv (debugger)" || echo "⚠️ dlv not installed"
+          else
+            echo "⚠️ Go is missing - Go tools skipped"
+          fi
+          if command -v code > /dev/null; then
+            code --install-extension golang.go --force > /dev/null 2>&1 && echo "✅ VS Code Go extension" || echo "⚠️ VS Code Go extension not installed"
+          fi
+
           touch /tmp/devtools.done
           DEVSCRIPT
           chmod +x ~/devtools-setup.sh
 
           nohup setsid bash ~/devtools-setup.sh > /dev/null 2>&1 &
-          echo "Antigravity / Antigravity CLI / Copilot CLI install in the background (log: /tmp/devtools-setup.log)"
+          echo "Antigravity / Antigravity CLI / Copilot CLI / Go tools install in the background (log: /tmp/devtools-setup.log)"
 
       - name: Install Google Drive Shell (gdsh)
         run: |
@@ -1065,7 +1232,7 @@ jobs:
           echo "Git user email: $([ -n "$(git config --global user.email)" ] && echo set || echo 'not set')"
 
       # ------------------------------------------------------------------
-      # NEW: Clone your repositories into ~/Downloads (in the BACKGROUND, desktop is usable meanwhile).
+      # Clone your repositories into ~/Downloads (in the BACKGROUND, desktop is usable meanwhile).
       # The list comes from the secret CLONE_REPOS (one repository URL per line).
       # PRIVACY: repository names and URLs are NEVER written to the GitHub log.
       # Details only go to /tmp/repo-clone.log on the remote computer.
@@ -1172,42 +1339,124 @@ jobs:
           echo "$SCALE" > ~/.config/desktop-scale
           echo "Default UI scale: $SCALE"
 
-          # NEW: times for the on-screen countdown (same values as the Keep Alive step)
+          # Times for the on-screen countdown (same values as the Keep Alive step)
           START=$(cat /tmp/start-ts)
           echo $((START + SESSION_MINUTES * 60)) > /tmp/runner-end-ts
           echo $((START + HANDOVER_MINUTES * 60)) > /tmp/runner-handover-ts
 
+          # ------------------------------------------------------------------
+          # NEW: Gemini in Chrome ("Ask Gemini" button, Gemini side panel, Skills, Alt+G, Help me write,
+          # tab organizer, AI history search, AI Mode ...).
+          # Google officially releases Gemini in Chrome only for Windows, Mac and Chromebook Plus.
+          # The Linux Chrome contains the feature, but Google's experiment config ("variations seed")
+          # switches it off. So before every Chrome start:
+          #   1. the seed is deleted and Chrome is not allowed to download a new one
+          #   2. "Local State" is marked as US + eligible for Gemini, Chrome language = English (US)
+          #      (Skills need English US)
+          #   3. the Gemini features are switched on via command line
+          #   4. Chrome policies explicitly ALLOW all Gemini / AI features (see below)
+          # You still have to sign in to Chrome with your Google account (once per desktop).
+          # ------------------------------------------------------------------
+          sudo mkdir -p /etc/opt/chrome/policies/managed
+          sudo tee /etc/opt/chrome/policies/managed/gemini-ai.json > /dev/null << 'EOF'
+          {
+            "GeminiSettings": 0,
+            "GeminiActOnWebSettings": 0,
+            "GenAiDefaultSettings": 0,
+            "HelpMeWriteSettings": 0,
+            "TabOrganizerSettings": 0,
+            "TabCompareSettings": 0,
+            "HistorySearchSettings": 0,
+            "DevToolsGenAiSettings": 0,
+            "CreateThemesSettings": 0,
+            "AIModeSettings": 0,
+            "SearchContentSharingSettings": 0
+          }
+          EOF
+          sudo chmod 644 /etc/opt/chrome/policies/managed/gemini-ai.json
+
           # Chrome start script: reads the chosen scale, sharp grayscale text, no smooth scrolling.
-          # Before Chrome starts, the page zoom is set to 125 % (Settings > Appearance > Page zoom)
-          # and old Chrome lock files are removed.
+          # Before Chrome starts, the page zoom is set to 125 % (Settings > Appearance > Page zoom),
+          # old Chrome lock files are removed and Gemini in Chrome is unlocked (see above).
           sudo tee /usr/local/bin/chrome-warp > /dev/null << 'EOF'
           #!/bin/bash
           SCALE=$(cat "$HOME/.config/desktop-scale" 2>/dev/null || echo 1)
           PROFILE="$HOME/.config/google-chrome"
           if ! pgrep -x chrome > /dev/null; then
             rm -f "$PROFILE"/Singleton* 2>/dev/null
+            # Gemini: remove the experiment config that switches Gemini off on Linux
+            rm -f "$PROFILE"/Variations "$PROFILE"/VariationsSeed* "$PROFILE"/VariationsSafeSeed* 2>/dev/null
             mkdir -p "$PROFILE/Default"
-            python3 - "$PROFILE/Default/Preferences" << 'PY'
+            VERSION=$(/usr/bin/google-chrome-stable --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)
+            python3 - "$PROFILE/Default/Preferences" "$PROFILE/Local State" "${VERSION:-0}" << 'PY'
           import json, math, os, sys
-          path = sys.argv[1]
-          try:
-              with open(path) as f:
-                  prefs = json.load(f)
-          except Exception:
-              prefs = {}
+          prefs_path, state_path, version = sys.argv[1], sys.argv[2], sys.argv[3]
+
+
+          def load(path):
+              try:
+                  with open(path) as f:
+                      data = json.load(f)
+                  return data if isinstance(data, dict) else {}
+              except Exception:
+                  return {}
+
+
+          def save(path, data):
+              tmp = path + ".tmp"
+              with open(tmp, "w") as f:
+                  json.dump(data, f)
+              os.replace(tmp, path)
+
+
+          def mark_eligible(node):
+              if isinstance(node, dict):
+                  for key, value in node.items():
+                      if key == "is_glic_eligible":
+                          node[key] = True
+                      else:
+                          mark_eligible(value)
+              elif isinstance(node, list):
+                  for value in node:
+                      mark_eligible(value)
+
+
+          # --- profile preferences: page zoom 125 %, languages English (US) first ---
+          prefs = load(prefs_path)
           # Chrome stores the zoom as a level: 125 % = log(1.25) / log(1.2)
           level = math.log(1.25) / math.log(1.2)
           prefs.setdefault("partition", {}).setdefault("default_zoom_level", {})["x"] = level
-          tmp = path + ".tmp"
-          with open(tmp, "w") as f:
-              json.dump(prefs, f)
-          os.replace(tmp, path)
+          intl = prefs.setdefault("intl", {})
+          intl["selected_languages"] = "en-US,en,de"
+          intl["accept_languages"] = "en-US,en,de"
+          save(prefs_path, prefs)
+
+          # --- browser state: US, eligible for Gemini, no stored experiment seed ---
+          state = load(state_path)
+          for key in [k for k in list(state) if k.startswith("variations_") and ("seed" in k or "signature" in k)]:
+              state.pop(key, None)
+          state["variations_country"] = "us"
+          state["variations_permanent_consistency_country"] = [version, "us"]
+          state.setdefault("glic", {})["is_glic_eligible"] = True
+          mark_eligible(state)
+          state.setdefault("intl", {})["app_locale"] = "en-US"
+          labs = state.setdefault("browser", {}).setdefault("enabled_labs_experiments", [])
+          for flag in ("glic@1", "glic-side-panel@1"):
+              if flag not in labs:
+                  labs.append(flag)
+          save(state_path, state)
           PY
           fi
           exec /usr/bin/google-chrome-stable \
             --proxy-server="socks5://127.0.0.1:1080" \
             --force-device-scale-factor="$SCALE" \
-            --force-dark-mode --enable-features=WebUIDarkMode \
+            --force-dark-mode \
+            --lang=en-US \
+            --enable-features=WebUIDarkMode,Glic,GlicRollout,GlicSidePanel,GlicActor,GlicLiveMode,GlicContextMenu,GlicWarming \
+            --disable-features=GlicCountryFiltering,GlicLocaleFiltering,GlicUserStatusCheck \
+            --glic-always-skip-fre \
+            --variations-server-url=http://127.0.0.1:9/ \
+            --variations-insecure-server-url=http://127.0.0.1:9/ \
             --start-maximized --no-first-run --no-default-browser-check \
             --disable-session-crashed-bubble --password-store=basic \
             --disable-smooth-scrolling \
@@ -1259,15 +1508,36 @@ jobs:
           sudo chmod +x /usr/local/bin/desktop-scale
 
           # ------------------------------------------------------------------
-          # NEW: Runner clock (bottom right, directly above the bottom panel)
-          #  - big:   current GERMAN time (Europe/Berlin, switches CET/CEST automatically)
-          #  - small: time left until this runner shuts down + end time
+          # NEW: "Run" dialog for Win+R (like Windows: type a program or command and press Enter)
+          # ------------------------------------------------------------------
+          sudo tee /usr/local/bin/run-dialog > /dev/null << 'EOF'
+          #!/bin/bash
+          CMD=$(zenity --entry --title="Run" --width=440 \
+                --text="Type the name of a program or command (e.g. code, nautilus, google-chrome):") || exit 0
+          [ -z "$CMD" ] && exit 0
+          case "$CMD" in
+            google-chrome|google-chrome-stable|chrome) CMD=/usr/local/bin/chrome-warp ;;
+            code) CMD=/usr/local/bin/vscode-launch ;;
+          esac
+          setsid bash -c "$CMD" > /dev/null 2>&1 &
+          EOF
+          sudo chmod +x /usr/local/bin/run-dialog
+
+          # ------------------------------------------------------------------
+          # Runner clock (bottom right, directly above the bottom panel) - same size as before:
+          #  - line 1 (small): time left until this runner shuts down + end time
+          #  - line 2: NEW world clock in ONE line, small, from west to east:
+          #      CA (California), TX (Texas), OK (Oklahoma), FL (Florida), NY (New York),
+          #      BR (Palmital, Parana, Brazil), Srv (time of this virtual server), IN (India), CN (China/Beijing)
+          #    and at the end, big as before: the GERMAN time (Europe/Berlin, CET/CEST automatically).
+          #  - Hover = all places with full names, weekday and date.
+          #  - Summer/winter time of every place is switched automatically (time zone database).
           #  The system time zone and region are NOT changed (stay UTC / en_US).
-          #  Colours: green > 60 min, yellow <= 60 min, red <= 15 min. Hover = details.
+          #  Colours: green > 60 min, yellow <= 60 min, red <= 15 min.
           # ------------------------------------------------------------------
           sudo tee /usr/local/bin/runner-clock > /dev/null << 'EOF'
           #!/usr/bin/python3
-          """runner-clock - German time and the time left until this runner shuts down."""
+          """runner-clock - world clock (German time big) and the time left until this runner shuts down."""
           import datetime as dt
           import re
           import subprocess
@@ -1281,12 +1551,41 @@ jobs:
 
           try:
               from zoneinfo import ZoneInfo
-              BERLIN = ZoneInfo("Europe/Berlin")
           except Exception:
-              BERLIN = None
+              ZoneInfo = None
+
+
+          def load_zone(name):
+              if ZoneInfo is None or not name:
+                  return None
+              try:
+                  return ZoneInfo(name)
+              except Exception:
+                  return None
+
+
+          BERLIN = load_zone("Europe/Berlin")
+
+          # (short label, time zone, name in the tooltip, fallback rule if no time zone database exists)
+          # Order: from west to east. The German time follows at the end (big).
+          WORLD = [
+              ("CA", "America/Los_Angeles", "California (Los Angeles, San Francisco)", ("us", -8)),
+              ("TX", "America/Chicago", "Texas (Dallas, Houston, Austin)", ("us", -6)),
+              ("OK", "America/Chicago", "Oklahoma (Oklahoma City, Tulsa)", ("us", -6)),
+              ("FL", "America/New_York", "Florida (Miami, Orlando, Tampa)", ("us", -5)),
+              ("NY", "America/New_York", "New York", ("us", -5)),
+              ("BR", "America/Sao_Paulo", "Palmital, Paraná (Brazil, Brasília time)", ("fixed", -3)),
+              ("Srv", "", "Server (system time of this virtual machine)", ("server", 0)),
+              ("IN", "Asia/Kolkata", "India (New Delhi, Mumbai, Bengaluru)", ("fixed", 5.5)),
+              ("CN", "Asia/Shanghai", "China (Beijing)", ("fixed", 8)),
+          ]
+          ZONES = {name: load_zone(name) for _, name, _, _ in WORLD if name}
 
           END_FILE = "/tmp/runner-end-ts"
           HANDOVER_FILE = "/tmp/runner-handover-ts"
+          SMALL_PT = 9   # font size of the world clock part (German time stays 12 pt)
+          MIN_PT = 7     # on very narrow screens the world clock part shrinks down to this size
+          DIM = "#9aa0a6"
 
           CSS = b"""
           #rc { background-color: #202124; }
@@ -1303,6 +1602,26 @@ jobs:
               return day - dt.timedelta(days=(day.weekday() + 1) % 7)
 
 
+          def nth_sunday(year, month, n):
+              first = dt.date(year, month, 1)
+              first_sunday = first + dt.timedelta(days=(6 - first.weekday()) % 7)
+              return first_sunday + dt.timedelta(weeks=n - 1)
+
+
+          def us_summer(utc, std):
+              """US daylight saving time: 2nd Sunday in March 02:00 until 1st Sunday in November 02:00 (local)."""
+              begin = dt.datetime.combine(nth_sunday(utc.year, 3, 2), dt.time(2), dt.timezone.utc) - dt.timedelta(hours=std)
+              end = dt.datetime.combine(nth_sunday(utc.year, 11, 1), dt.time(2), dt.timezone.utc) - dt.timedelta(hours=std + 1)
+              return begin <= utc < end
+
+
+          def utc_label(offset):
+              sign = "+" if offset >= 0 else "-"
+              minutes = int(round(abs(offset) * 60))
+              hours, rest = divmod(minutes, 60)
+              return f"UTC{sign}{hours}" + (f":{rest:02d}" if rest else "")
+
+
           def german_time(ts):
               utc = dt.datetime.fromtimestamp(ts, dt.timezone.utc)
               if BERLIN is not None:
@@ -1314,6 +1633,20 @@ jobs:
               if begin <= utc < end:
                   return utc + dt.timedelta(hours=2), "CEST"
               return utc + dt.timedelta(hours=1), "CET"
+
+
+          def zone_time(ts, name, rule):
+              kind, std = rule
+              if kind == "server":
+                  local = dt.datetime.fromtimestamp(ts).astimezone()
+                  return local, local.tzname() or "local"
+              utc = dt.datetime.fromtimestamp(ts, dt.timezone.utc)
+              tz = ZONES.get(name)
+              if tz is not None:
+                  local = utc.astimezone(tz)
+                  return local, local.tzname()
+              offset = std + 1 if kind == "us" and us_summer(utc, std) else std
+              return utc + dt.timedelta(hours=offset), utc_label(offset)
 
 
           def read_ts(path):
@@ -1398,42 +1731,65 @@ jobs:
                   self.panel = 0
                   self.scanned = 0.0
                   self.tip = ""
+                  self.markup = ""
+                  self.small_pt = SMALL_PT
                   self.connect("destroy", Gtk.main_quit)
                   self.update()
                   self.show_all()
 
                   screen = Gdk.Screen.get_default()
-                  screen.connect("size-changed", lambda *_: self.place(True))
-                  screen.connect("monitors-changed", lambda *_: self.place(True))
+                  screen.connect("size-changed", lambda *_: self.screen_changed())
+                  screen.connect("monitors-changed", lambda *_: self.screen_changed())
                   GLib.timeout_add(500, self.update)
                   GLib.timeout_add(2000, self.place)
                   self.place(True)
 
+              def screen_changed(self):
+                  self.small_pt = SMALL_PT   # new screen size: start again with the normal size
+                  self.update()
+                  self.place(True)
+
               def update(self):
                   now = time.time()
-                  local, tz = german_time(now)
-                  self.clock.set_text(f"{local:%H:%M:%S} {tz}")
+
+                  # ---- line 2: world clock (small) + German time (big) ----
+                  parts, world_tip = [], []
+                  for short, name, long_name, rule in WORLD:
+                      local, abbr = zone_time(now, name, rule)
+                      parts.append(f'<span foreground="{DIM}">{short}</span> {local:%H:%M}')
+                      world_tip.append(f"{short:<4}{local:%a %d.%m. %H:%M}  {abbr:<5}  {long_name}")
+                  de, tz = german_time(now)
+                  world_tip.append(f"{'DE':<4}{de:%a %d.%m. %H:%M}  {tz:<5}  Germany (Europe/Berlin)")
+                  world = "  ".join(parts)
+                  markup = (f'<span size="{self.small_pt * 1024}" weight="normal">{world}   '
+                            f'<span foreground="{DIM}">DE</span></span> {de:%H:%M:%S} {tz}')
+                  if markup != self.markup:
+                      self.clock.set_markup(markup)
+                      self.markup = markup
+
+                  # ---- line 1: time left until this runner shuts down ----
                   ctx = self.left.get_style_context()
                   for c in ("ok", "warn", "crit"):
                       ctx.remove_class(c)
+                  tip = "World clock (summer/winter time is switched automatically):\n" + "\n".join(world_tip)
+                  tip += "\nThe system time zone of the server is not changed."
                   end = read_ts(END_FILE)
                   if end is None:
                       self.left.set_text("Runner: time left unknown")
-                      return True
-                  left = int(end - now)
-                  end_local, end_tz = german_time(end)
-                  if left > 0:
-                      self.left.set_text(f"Runner: {fmt_left(left)} left (ends {end_local:%H:%M})")
-                      ctx.add_class("ok" if left > 3600 else "warn" if left > 900 else "crit")
                   else:
-                      self.left.set_text("Runner ending - new desktop takes over")
-                      ctx.add_class("crit")
-                  tip = (f"German time (Europe/Berlin). The system time zone is not changed.\n"
-                         f"This desktop ends at {end_local:%H:%M} {end_tz}.")
-                  hand = read_ts(HANDOVER_FILE)
-                  if hand:
-                      tip += f"\nThe next desktop starts preparing at {german_time(hand)[0]:%H:%M}."
-                  tip += "\nPush or save your work before the end - local files are not carried over."
+                      left = int(end - now)
+                      end_local, end_tz = german_time(end)
+                      if left > 0:
+                          self.left.set_text(f"Runner: {fmt_left(left)} left (ends {end_local:%H:%M})")
+                          ctx.add_class("ok" if left > 3600 else "warn" if left > 900 else "crit")
+                      else:
+                          self.left.set_text("Runner ending - new desktop takes over")
+                          ctx.add_class("crit")
+                      tip += f"\n\nThis desktop ends at {end_local:%H:%M} {end_tz} (German time)."
+                      hand = read_ts(HANDOVER_FILE)
+                      if hand:
+                          tip += f"\nThe next desktop starts preparing at {german_time(hand)[0]:%H:%M}."
+                      tip += "\nPush or save your work before the end - local files are not carried over."
                   if tip != self.tip:
                       self.set_tooltip_text(tip)
                       self.tip = tip
@@ -1452,7 +1808,13 @@ jobs:
                       self.scanned = time.monotonic()
                   nat = self.get_preferred_size()[1]
                   w, h = nat.width, nat.height
-                  x = g.x + g.width - w
+                  # Very narrow screen: make the world clock part smaller instead of taking more space
+                  if w > g.width * 0.85 and self.small_pt > MIN_PT:
+                      self.small_pt -= 1
+                      self.update()
+                      nat = self.get_preferred_size()[1]
+                      w, h = nat.width, nat.height
+                  x = g.x + max(0, g.width - w)
                   y = g.y + g.height - self.panel - h
                   if (x, y, w, h) != self.geo:
                       self.resize(w, h)
@@ -1610,6 +1972,29 @@ jobs:
           text/html=google-chrome.desktop
           EOF
 
+          # ------------------------------------------------------------------
+          # NEW: Windows-like APP shortcuts (window shortcuts like Alt+Tab are set in the session script)
+          #   Win+E          = Files            Win+R          = Run dialog
+          #   Win+I          = Settings         Ctrl+Shift+Esc = Task Manager (htop)
+          #   Ctrl+Alt+T     = Terminal
+          # ------------------------------------------------------------------
+          cat > ~/.xbindkeysrc << 'EOF'
+          "nautilus --new-window"
+            Mod4 + e
+
+          "/usr/local/bin/run-dialog"
+            Mod4 + r
+
+          "env GIO_USE_NETWORK_MONITOR=netlink XDG_CURRENT_DESKTOP=GNOME gnome-control-center"
+            Mod4 + i
+
+          "xfce4-terminal --geometry=110x30 --hide-menubar --hide-toolbar --title=TaskManager -x htop"
+            Control+Shift + Escape
+
+          "xfce4-terminal --geometry=110x30 --hide-menubar --hide-toolbar"
+            Control+Alt + t
+          EOF
+
           # Terminal look (fallback for older xfce4-terminal versions; newer ones are set via xfconf in the session script)
           cat > ~/.config/xfce4/terminal/terminalrc << 'EOF'
           [Configuration]
@@ -1645,7 +2030,7 @@ jobs:
           cat >> ~/.bashrc << 'EOF'
 
           # ---- Terminal comfort ----
-          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+          export PATH="/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
           export EDITOR=nano
           export VISUAL=nano
           export BROWSER=/usr/local/bin/chrome-warp
@@ -1689,7 +2074,7 @@ jobs:
           export DESKTOP_SESSION=gnome-flashback-metacity
           export NO_AT_BRIDGE=1
           export BROWSER=/usr/local/bin/chrome-warp
-          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+          export PATH="/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
           # Check network state directly instead of via NetworkManager (fixes "offline")
           export GIO_USE_NETWORK_MONITOR=netlink
           export XDG_RUNTIME_DIR="/tmp/runtime-$(id -u)"
@@ -1733,6 +2118,39 @@ jobs:
           gsettings set org.gnome.desktop.interface text-scaling-factor "$SCALE" 2>/dev/null || true
           gsettings set org.gnome.desktop.interface cursor-size "$(python3 -c "print(int(round(24*$SCALE)))")" 2>/dev/null || true
 
+          # ------------------------------------------------------------------
+          # NEW: Windows-like WINDOW shortcuts (window manager metacity)
+          #   Alt+Tab / Win+Tab           = switch between ALL windows (Shift = backwards)
+          #   Alt+Esc                     = cycle windows directly      Alt+F4      = close window
+          #   Win+Up / Win+Down           = maximize / restore          Win+H       = minimize
+          #   Win+Left / Win+Right        = window to left / right half Win+D, Win+M = show desktop
+          #   Ctrl+Win+Left / Right       = previous / next workspace   Alt+Space   = window menu
+          #   Win+S / Alt+F1              = applications menu
+          # ------------------------------------------------------------------
+          # Make sure the Windows key works as "Super" modifier
+          if ! xmodmap -pm 2>/dev/null | grep -E '^mod4' | grep -q Super_L; then
+            xmodmap -e 'add mod4 = Super_L Super_R' 2>/dev/null || true
+          fi
+          kb() { gsettings set "$1" "$2" "$3" 2>/dev/null || true; }
+          WMK=org.gnome.desktop.wm.keybindings
+          kb $WMK switch-applications "@as []"
+          kb $WMK switch-applications-backward "@as []"
+          kb $WMK switch-windows "['<Alt>Tab', '<Super>Tab']"
+          kb $WMK switch-windows-backward "['<Shift><Alt>Tab', '<Shift><Super>Tab']"
+          kb $WMK cycle-windows "['<Alt>Escape']"
+          kb $WMK cycle-windows-backward "['<Shift><Alt>Escape']"
+          kb $WMK close "['<Alt>F4']"
+          kb $WMK maximize "['<Super>Up']"
+          kb $WMK unmaximize "['<Super>Down']"
+          kb $WMK minimize "['<Super>h']"
+          kb $WMK show-desktop "['<Super>d', '<Super>m']"
+          kb $WMK activate-window-menu "['<Alt>space']"
+          kb $WMK panel-main-menu "['<Alt>F1', '<Super>s']"
+          kb $WMK switch-to-workspace-left "['<Control><Super>Left']"
+          kb $WMK switch-to-workspace-right "['<Control><Super>Right']"
+          kb org.gnome.metacity.keybindings toggle-tiled-left "['<Super>Left']"
+          kb org.gnome.metacity.keybindings toggle-tiled-right "['<Super>Right']"
+
           for f in "$HOME"/Desktop/*.desktop; do gio set "$f" metadata::trusted true 2>/dev/null || true; done
 
           # Terminal look (xfce4-terminal 1.x stores settings in xfconf)
@@ -1770,7 +2188,9 @@ jobs:
             start_if_missing metacity metacity --replace
             start_if_missing gnome-flashback gnome-flashback
             start_if_missing gnome-panel gnome-panel
-            # NEW: German time + runner countdown (bottom right)
+            # NEW: Windows-like app shortcuts (Win+E, Win+R, Win+I, Ctrl+Shift+Esc, Ctrl+Alt+T)
+            command -v xbindkeys >/dev/null && start_if_missing xbindkeys xbindkeys -n -f "$HOME/.xbindkeysrc"
+            # German time + world clock + runner countdown (bottom right)
             if ! pgrep -u "$(id -u)" -f /usr/local/bin/runner-clock >/dev/null; then
               echo "$(date '+%H:%M:%S') starting runner-clock"
               /usr/local/bin/runner-clock >> /tmp/desktop-runner-clock.log 2>&1 &
@@ -1899,12 +2319,15 @@ jobs:
           pgrep -a -x gnome-flashback || echo "⚠️ gnome-flashback is not running"
           pgrep -a -x gnome-panel || echo "⚠️ gnome-panel is not running"
           pgrep -a -x gsd-xsettings || echo "⚠️ gsd-xsettings is not running (fonts/scale may look different)"
+          pgrep -x xbindkeys >/dev/null && echo "xbindkeys is running (Win+E, Win+R, Win+I, Ctrl+Shift+Esc)" || echo "⚠️ xbindkeys is not running (see /tmp/desktop-xbindkeys.log)"
           pgrep -f /usr/local/bin/runner-clock >/dev/null && echo "runner-clock is running" || echo "⚠️ runner-clock is not running (see /tmp/desktop-runner-clock.log)"
 
           echo "=========================================="
           echo "✅ GNOME Remote Desktop is running and reachable via Cloudflare Zero Trust."
           echo "   Open https://YOUR-SUBDOMAIN.YOUR-DOMAIN.com/ (uses the sharp + smooth settings automatically)"
           echo "   or directly: https://YOUR-SUBDOMAIN.YOUR-DOMAIN.com/vnc.html?autoconnect=true&resize=remote&quality=9&compression=2&reconnect=true"
+          echo "   Press F11 in Chrome/Edge: full screen in which Alt+Tab, Win+Tab and the Windows key go to the remote desktop."
+          echo "   Gemini in Chrome: sign in to Chrome on the remote desktop, then click 'Ask Gemini' (top right) or press Alt+G."
           echo "   VNC mode: $(cat /tmp/vnc-mode)"
           echo "   Desktop ready after $(( $(date +%s) - $(cat /tmp/start-ts) )) seconds."
           echo "=========================================="
@@ -1928,7 +2351,7 @@ jobs:
           echo "Total time so far: $(( $(date +%s) - $(cat /tmp/start-ts) )) seconds."
 
       # Only shows the result. The desktop is already usable, nothing waits for this step.
-      - name: Check VS Code, Antigravity, Antigravity CLI, Copilot CLI, Git & Repositories
+      - name: Check VS Code, Go, Antigravity, Antigravity CLI, Copilot CLI, Git & Repositories
         run: |
           for i in $(seq 1 100); do
             [ -f /tmp/devtools.done ] && break
@@ -1937,8 +2360,10 @@ jobs:
           echo "---------- Dev tools log ----------"
           cat /tmp/devtools-setup.log 2>/dev/null || true
           echo "-----------------------------------"
-          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+          export PATH="/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
           echo "VS Code:          $(code --version 2>/dev/null | head -1 || echo 'missing')"
+          echo "Go:               $(go version 2>/dev/null || echo '⚠️ missing')"
+          echo "Go tools:         gopls $(command -v gopls >/dev/null && echo ok || echo '⚠️ missing'), dlv $(command -v dlv >/dev/null && echo ok || echo '⚠️ missing')"
           if [ -x /usr/local/bin/antigravity ] || [ -x /usr/bin/antigravity ]; then
             echo "Antigravity IDE:  installed"
           else
