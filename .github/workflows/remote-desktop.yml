@@ -213,7 +213,7 @@ jobs:
             PIDS+=($!)
             DEBS+=(/tmp/dl/google-chrome-stable_current_amd64.deb)
           fi
-          # NEW: Go (latest stable version from go.dev), downloaded in parallel. A failure here does not stop the desktop.
+          # Go (latest stable version from go.dev), downloaded in parallel. A failure here does not stop the desktop.
           (
             GO_VER=$(curl -fsSL "https://go.dev/dl/?mode=json" | jq -r '[.[] | select(.stable)][0].version' 2>/dev/null)
             [ -n "$GO_VER" ] && [ "$GO_VER" != "null" ] && curl -fsSL -o /tmp/dl/go.tar.gz "https://go.dev/dl/${GO_VER}.linux-amd64.tar.gz"
@@ -226,7 +226,8 @@ jobs:
           chmod 644 /tmp/dl/*.deb
 
           # Everything in ONE apt call. Tools already on the runner are skipped by apt.
-          # NEW: tzdata (world clock time zones) and xbindkeys (Windows-like app shortcuts)
+          # tzdata (world clock time zones), xbindkeys (Windows-like app shortcuts),
+          # NEW: privoxy + netcat-openbsd (system-wide proxy through WARP for all apps)
           sudo apt-get install -y "${DEBS[@]}" \
             gnome-session-flashback \
             gnome-flashback \
@@ -285,13 +286,15 @@ jobs:
             lsof \
             psmisc \
             xclip \
+            privoxy \
+            netcat-openbsd \
             xbindkeys \
             tzdata \
             libsecret-1-0 \
             libsecret-tools \
             desktop-file-utils \
             xdg-utils
-          # NEW: install Go into /usr/local/go (official layout) and make it available everywhere
+          # Install Go into /usr/local/go (official layout) and make it available everywhere
           if wait "$GO_PID" && [ -s /tmp/dl/go.tar.gz ]; then
             sudo rm -rf /usr/local/go
             sudo tar -C /usr/local -xzf /tmp/dl/go.tar.gz
@@ -375,7 +378,7 @@ jobs:
           EOF
 
           # ------------------------------------------------------------------
-          # NEW: Windows shortcuts go to the REMOTE desktop (Keyboard Lock).
+          # Windows shortcuts go to the REMOTE desktop (Keyboard Lock).
           #  - F11 (or the full screen button in the noVNC side bar) opens a special full screen
           #    in which Chrome / Edge pass Alt+Tab, Win+Tab, the Windows key, Alt+F4, Esc ...
           #    to the remote desktop instead of to Windows.
@@ -514,7 +517,7 @@ jobs:
           MISSING=""
           for c in cp mv rm mkdir ls cat find grep sed awk tar gzip bzip2 xz zip unzip 7z bsdtar rsync \
                    nano git jq rg fd bat curl wget less file tree htop ncdu mc fzf zoxide tmux zenity \
-                   xfce4-terminal python3 google-chrome-stable cloudflared Xtigervnc Xvfb x11vnc xprop xmodmap xbindkeys code gh go; do
+                   xfce4-terminal python3 google-chrome-stable cloudflared Xtigervnc Xvfb x11vnc xprop xmodmap xbindkeys code gh go privoxy nc; do
             command -v "$c" >/dev/null || MISSING="$MISSING $c"
           done
           if [ -n "$MISSING" ]; then
@@ -1172,6 +1175,92 @@ jobs:
           echo "✅ Cloudflare Zero Trust Root CA installed."
 
       # ------------------------------------------------------------------
+      # NEW: ALL traffic of the desktop goes through Cloudflare WARP (Zero Trust), not only Chrome.
+      #   WARP SOCKS5 proxy (127.0.0.1:1080)  <-  Privoxy turns it into an HTTP proxy (127.0.0.1:8118)
+      #   Used by: terminal, git (https + ssh), go, curl/wget, pip, npm/node, apt (also with sudo),
+      #            VS Code, Antigravity, Copilot CLI, agy, Files / Google Drive, GNOME Online Accounts.
+      #   Chrome keeps using the WARP SOCKS5 proxy directly (as before).
+      #   Fail closed: if WARP is down, these apps get NO internet (no data leak past Cloudflare).
+      #   Only local addresses (localhost, 127.x) stay direct, so VNC / noVNC keep working.
+      #   NOT routed (on purpose): the setup steps of this workflow itself (installing, cloning the
+      #   repos, Cloudflare Tunnel, GitHub handover). They run before WARP is ready and must keep the
+      #   desktop chain alive even if WARP fails.
+      # ------------------------------------------------------------------
+      - name: Route all desktop traffic through WARP (system-wide proxy)
+        run: |
+          # 1. Privoxy: HTTP proxy on 127.0.0.1:8118 -> WARP SOCKS5 on 127.0.0.1:1080 (no filtering)
+          sudo tee /etc/privoxy/config > /dev/null << 'EOF'
+          confdir /etc/privoxy
+          logdir /var/log/privoxy
+          listen-address 127.0.0.1:8118
+          toggle 0
+          enable-remote-toggle 0
+          enable-edit-actions 0
+          enable-remote-http-toggle 0
+          accept-intercepted-requests 0
+          forward-socks5t / 127.0.0.1:1080 .
+          forward localhost .
+          forward 127.0.0.1 .
+          keep-alive-timeout 300
+          socket-timeout 300
+          max-client-connections 512
+          EOF
+          sudo systemctl restart privoxy 2>/dev/null || sudo privoxy --user privoxy /etc/privoxy/config
+          sleep 1
+          (ss -ltn 2>/dev/null | grep -q '127.0.0.1:8118') && echo "✅ Privoxy listens on 127.0.0.1:8118" || echo "⚠️ Privoxy is not running"
+
+          # 2. Proxy variables for every program (lower and upper case, many tools read only one of them)
+          sudo tee /etc/warp-proxy.env > /dev/null << 'EOF'
+          # All traffic through Cloudflare WARP (see workflow step "Route all desktop traffic through WARP")
+          export http_proxy=http://127.0.0.1:8118
+          export https_proxy=http://127.0.0.1:8118
+          export ftp_proxy=http://127.0.0.1:8118
+          export all_proxy=socks5h://127.0.0.1:1080
+          export no_proxy=localhost,127.0.0.1,::1
+          export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy FTP_PROXY=$ftp_proxy ALL_PROXY=$all_proxy NO_PROXY=$no_proxy
+          # Node.js (Copilot CLI, npm tools) uses the proxy variables only with this switch (Node 24+)
+          export NODE_USE_ENV_PROXY=1
+          # Trust the Cloudflare Zero Trust certificate also in Python, Node.js and Go
+          export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+          export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+          export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+          EOF
+          sudo chmod 644 /etc/warp-proxy.env
+
+          # 3. sudo keeps the proxy (so "sudo apt install ..." also goes through WARP)
+          echo 'Defaults env_keep += "http_proxy https_proxy ftp_proxy all_proxy no_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY SSL_CERT_FILE REQUESTS_CA_BUNDLE NODE_EXTRA_CA_CERTS NODE_USE_ENV_PROXY"' \
+            | sudo tee /etc/sudoers.d/warp-proxy > /dev/null
+          sudo chmod 440 /etc/sudoers.d/warp-proxy
+          sudo visudo -cf /etc/sudoers.d/warp-proxy > /dev/null || { echo "⚠️ sudoers file invalid - removed"; sudo rm -f /etc/sudoers.d/warp-proxy; }
+
+          # 4. git over SSH (git@github.com:...) and every other SSH connection also through WARP
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          cat >> ~/.ssh/config << 'EOF'
+
+          # All SSH connections through Cloudflare WARP (except local ones)
+          Host * !localhost !127.0.0.1
+            ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p
+          EOF
+          chmod 600 ~/.ssh/config
+
+          # 5. Check command for the terminal: "proxy-check"
+          sudo tee /usr/local/bin/proxy-check > /dev/null << 'EOF'
+          #!/bin/bash
+          . /etc/warp-proxy.env
+          echo "Testing the way out through Cloudflare ..."
+          OUT=$(curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace)
+          if [ -z "$OUT" ]; then
+            echo "❌ No connection. WARP is probably not connected (see /tmp/warp-setup.log)."
+            echo "   For a single command without WARP use:  direct <command>"
+            exit 1
+          fi
+          echo "$OUT" | grep -E '^(warp|gateway|colo|loc)='
+          echo "$OUT" | grep -qE '^(warp=(on|plus)|gateway=on)' && echo "✅ Traffic goes through Cloudflare WARP" || echo "⚠️ Answer received, but WARP is not shown as active"
+          EOF
+          sudo chmod +x /usr/local/bin/proxy-check
+          echo "✅ System-wide WARP proxy configured (check later on the desktop with: proxy-check)"
+
+      # ------------------------------------------------------------------
       # Git name/email + GitHub token from secrets.
       # git clone/pull/push, gh and Copilot CLI work without ever pasting the token.
       # ------------------------------------------------------------------
@@ -1345,7 +1434,7 @@ jobs:
           echo $((START + HANDOVER_MINUTES * 60)) > /tmp/runner-handover-ts
 
           # ------------------------------------------------------------------
-          # NEW: Gemini in Chrome ("Ask Gemini" button, Gemini side panel, Skills, Alt+G, Help me write,
+          # Gemini in Chrome ("Ask Gemini" button, Gemini side panel, Skills, Alt+G, Help me write,
           # tab organizer, AI history search, AI Mode ...).
           # Google officially releases Gemini in Chrome only for Windows, Mac and Chromebook Plus.
           # The Linux Chrome contains the feature, but Google's experiment config ("variations seed")
@@ -1467,18 +1556,24 @@ jobs:
           sudo chmod +x /usr/local/bin/chrome-warp
 
           # VS Code start script (no GPU in VNC = smoother, logins saved in the GNOME keyring)
+          # NEW: all VS Code traffic (sign-in, extensions, Copilot) through WARP
           sudo tee /usr/local/bin/vscode-launch > /dev/null << 'EOF'
           #!/bin/bash
-          exec /usr/bin/code --disable-gpu --password-store=gnome-libsecret "$@"
+          [ -f /etc/warp-proxy.env ] && . /etc/warp-proxy.env
+          exec /usr/bin/code --disable-gpu --password-store=gnome-libsecret \
+            --proxy-server=http://127.0.0.1:8118 --proxy-bypass-list="<local>" "$@"
           EOF
           sudo chmod +x /usr/local/bin/vscode-launch
 
           # Antigravity start script (waits politely if the background installation is not finished yet)
+          # NEW: all Antigravity traffic through WARP
           sudo tee /usr/local/bin/antigravity-launch > /dev/null << 'EOF'
           #!/bin/bash
+          [ -f /etc/warp-proxy.env ] && . /etc/warp-proxy.env
           for b in /usr/local/bin/antigravity /usr/bin/antigravity; do
             if [ -x "$b" ]; then
-              exec "$b" --disable-gpu --password-store=gnome-libsecret "$@"
+              exec "$b" --disable-gpu --password-store=gnome-libsecret \
+                --proxy-server=http://127.0.0.1:8118 --proxy-bypass-list="<local>" "$@"
             fi
           done
           if [ ! -f /tmp/devtools.done ]; then
@@ -1508,7 +1603,7 @@ jobs:
           sudo chmod +x /usr/local/bin/desktop-scale
 
           # ------------------------------------------------------------------
-          # NEW: "Run" dialog for Win+R (like Windows: type a program or command and press Enter)
+          # "Run" dialog for Win+R (like Windows: type a program or command and press Enter)
           # ------------------------------------------------------------------
           sudo tee /usr/local/bin/run-dialog > /dev/null << 'EOF'
           #!/bin/bash
@@ -1526,7 +1621,7 @@ jobs:
           # ------------------------------------------------------------------
           # Runner clock (bottom right, directly above the bottom panel) - same size as before:
           #  - line 1 (small): time left until this runner shuts down + end time
-          #  - line 2: NEW world clock in ONE line, small, from west to east:
+          #  - line 2: world clock in ONE line, small, from west to east:
           #      CA (California), TX (Texas), OK (Oklahoma), FL (Florida), NY (New York),
           #      BR (Palmital, Parana, Brazil), Srv (time of this virtual server), IN (India), CN (China/Beijing)
           #    and at the end, big as before: the GERMAN time (Europe/Berlin, CET/CEST automatically).
@@ -1973,7 +2068,7 @@ jobs:
           EOF
 
           # ------------------------------------------------------------------
-          # NEW: Windows-like APP shortcuts (window shortcuts like Alt+Tab are set in the session script)
+          # Windows-like APP shortcuts (window shortcuts like Alt+Tab are set in the session script)
           #   Win+E          = Files            Win+R          = Run dialog
           #   Win+I          = Settings         Ctrl+Shift+Esc = Task Manager (htop)
           #   Ctrl+Alt+T     = Terminal
@@ -2031,6 +2126,10 @@ jobs:
 
           # ---- Terminal comfort ----
           export PATH="/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+          # All traffic (git, go, curl, pip, npm, apt ...) through Cloudflare WARP. Check: proxy-check
+          [ -f /etc/warp-proxy.env ] && . /etc/warp-proxy.env
+          # Emergency only (WARP down): run ONE command without WARP, e.g.  direct git pull
+          direct() { env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY -u ALL_PROXY "$@"; }
           export EDITOR=nano
           export VISUAL=nano
           export BROWSER=/usr/local/bin/chrome-warp
@@ -2075,20 +2174,34 @@ jobs:
           export NO_AT_BRIDGE=1
           export BROWSER=/usr/local/bin/chrome-warp
           export PATH="/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+          # NEW: every program started on the desktop goes through WARP
+          [ -f /etc/warp-proxy.env ] && . /etc/warp-proxy.env
           # Check network state directly instead of via NetworkManager (fixes "offline")
           export GIO_USE_NETWORK_MONITOR=netlink
           export XDG_RUNTIME_DIR="/tmp/runtime-$(id -u)"
           mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
 
-          # Own D-Bus session
+          # Own D-Bus session (apps started via D-Bus also get the WARP proxy variables)
           eval "$(dbus-launch --sh-syntax)"
           export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
-          dbus-update-activation-environment GIO_USE_NETWORK_MONITOR DISPLAY XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR BROWSER PATH 2>/dev/null || true
+          dbus-update-activation-environment GIO_USE_NETWORK_MONITOR DISPLAY XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR BROWSER PATH \
+            http_proxy https_proxy ftp_proxy all_proxy no_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY \
+            NODE_USE_ENV_PROXY SSL_CERT_FILE REQUESTS_CA_BUNDLE NODE_EXTRA_CA_CERTS 2>/dev/null || true
 
           # Unlock keyring with empty password (for Online Accounts / Google Drive / VS Code / Antigravity)
           echo -n "" | gnome-keyring-daemon --unlock --components=secrets,pkcs11 >/dev/null 2>&1 || true
           eval "$(gnome-keyring-daemon --start --components=secrets,pkcs11 2>/dev/null)" || true
           export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
+
+          # NEW: GNOME proxy (Files / Google Drive, Online Accounts, GNOME apps) through WARP
+          gsettings set org.gnome.system.proxy mode 'manual' 2>/dev/null || true
+          gsettings set org.gnome.system.proxy.http host '127.0.0.1' 2>/dev/null || true
+          gsettings set org.gnome.system.proxy.http port 8118 2>/dev/null || true
+          gsettings set org.gnome.system.proxy.https host '127.0.0.1' 2>/dev/null || true
+          gsettings set org.gnome.system.proxy.https port 8118 2>/dev/null || true
+          gsettings set org.gnome.system.proxy.socks host '127.0.0.1' 2>/dev/null || true
+          gsettings set org.gnome.system.proxy.socks port 1080 2>/dev/null || true
+          gsettings set org.gnome.system.proxy ignore-hosts "['localhost', '127.0.0.0/8', '::1']" 2>/dev/null || true
 
           # Dark theme & desktop icons
           gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark' || true
@@ -2119,7 +2232,7 @@ jobs:
           gsettings set org.gnome.desktop.interface cursor-size "$(python3 -c "print(int(round(24*$SCALE)))")" 2>/dev/null || true
 
           # ------------------------------------------------------------------
-          # NEW: Windows-like WINDOW shortcuts (window manager metacity)
+          # Windows-like WINDOW shortcuts (window manager metacity)
           #   Alt+Tab / Win+Tab           = switch between ALL windows (Shift = backwards)
           #   Alt+Esc                     = cycle windows directly      Alt+F4      = close window
           #   Win+Up / Win+Down           = maximize / restore          Win+H       = minimize
@@ -2188,7 +2301,7 @@ jobs:
             start_if_missing metacity metacity --replace
             start_if_missing gnome-flashback gnome-flashback
             start_if_missing gnome-panel gnome-panel
-            # NEW: Windows-like app shortcuts (Win+E, Win+R, Win+I, Ctrl+Shift+Esc, Ctrl+Alt+T)
+            # Windows-like app shortcuts (Win+E, Win+R, Win+I, Ctrl+Shift+Esc, Ctrl+Alt+T)
             command -v xbindkeys >/dev/null && start_if_missing xbindkeys xbindkeys -n -f "$HOME/.xbindkeysrc"
             # German time + world clock + runner countdown (bottom right)
             if ! pgrep -u "$(id -u)" -f /usr/local/bin/runner-clock >/dev/null; then
@@ -2321,12 +2434,14 @@ jobs:
           pgrep -a -x gsd-xsettings || echo "⚠️ gsd-xsettings is not running (fonts/scale may look different)"
           pgrep -x xbindkeys >/dev/null && echo "xbindkeys is running (Win+E, Win+R, Win+I, Ctrl+Shift+Esc)" || echo "⚠️ xbindkeys is not running (see /tmp/desktop-xbindkeys.log)"
           pgrep -f /usr/local/bin/runner-clock >/dev/null && echo "runner-clock is running" || echo "⚠️ runner-clock is not running (see /tmp/desktop-runner-clock.log)"
+          pgrep -x privoxy >/dev/null && echo "privoxy is running (system-wide WARP proxy)" || echo "⚠️ privoxy is not running - apps outside Chrome have no internet"
 
           echo "=========================================="
           echo "✅ GNOME Remote Desktop is running and reachable via Cloudflare Zero Trust."
           echo "   Open https://YOUR-SUBDOMAIN.YOUR-DOMAIN.com/ (uses the sharp + smooth settings automatically)"
           echo "   or directly: https://YOUR-SUBDOMAIN.YOUR-DOMAIN.com/vnc.html?autoconnect=true&resize=remote&quality=9&compression=2&reconnect=true"
           echo "   Press F11 in Chrome/Edge: full screen in which Alt+Tab, Win+Tab and the Windows key go to the remote desktop."
+          echo "   All apps (terminal, git, go, VS Code ...) go through WARP. Check on the desktop: proxy-check"
           echo "   Gemini in Chrome: sign in to Chrome on the remote desktop, then click 'Ask Gemini' (top right) or press Alt+G."
           echo "   VNC mode: $(cat /tmp/vnc-mode)"
           echo "   Desktop ready after $(( $(date +%s) - $(cat /tmp/start-ts) )) seconds."
@@ -2347,6 +2462,12 @@ jobs:
             echo "⚠️ WARP setup failed. Chrome will not load pages (no data leak)."
           elif [ ! -f /tmp/warp.done ]; then
             echo "⚠️ WARP was not finished after 5 minutes. See log above."
+          fi
+          # NEW: check the system-wide proxy (terminal, git, go ...) - only prints whether WARP is active
+          if curl -s --max-time 15 -x http://127.0.0.1:8118 https://www.cloudflare.com/cdn-cgi/trace | grep -qE '^(warp=(on|plus)|gateway=on)'; then
+            echo "✅ System-wide proxy: terminal, git, go and all apps go through Cloudflare WARP"
+          else
+            echo "⚠️ System-wide proxy: no way out through WARP - apps on the desktop have no internet (fail closed)"
           fi
           echo "Total time so far: $(( $(date +%s) - $(cat /tmp/start-ts) )) seconds."
 
@@ -2394,6 +2515,7 @@ jobs:
               pgrep -x x11vnc >/dev/null || echo "⚠️ x11vnc is no longer running"
             fi
             pgrep -x cloudflared >/dev/null || echo "⚠️ cloudflared is no longer running"
+            pgrep -x privoxy >/dev/null || { echo "⚠️ privoxy stopped - restarting"; sudo systemctl restart privoxy 2>/dev/null || true; }
             echo "Load: $(cut -d' ' -f1-3 /proc/loadavg) | Free RAM: $(free -m | awk '/Mem:/ {print $7}') MB"
           }
 
