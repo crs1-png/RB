@@ -1536,6 +1536,8 @@ jobs:
           save(state_path, state)
           PY
           fi
+          # WebGL ON (e.g. Google Earth): there is no graphics card in the VNC desktop, so Chrome
+          # renders WebGL in software (SwiftShader). Without these flags Chrome turns WebGL off.
           exec /usr/bin/google-chrome-stable \
             --proxy-server="socks5://127.0.0.1:1080" \
             --force-device-scale-factor="$SCALE" \
@@ -1551,6 +1553,11 @@ jobs:
             --disable-smooth-scrolling \
             --disable-lcd-text \
             --force-color-profile=srgb \
+            --ignore-gpu-blocklist \
+            --enable-webgl \
+            --use-gl=angle \
+            --use-angle=swiftshader \
+            --enable-unsafe-swiftshader \
             "$@"
           EOF
           sudo chmod +x /usr/local/bin/chrome-warp
