@@ -289,6 +289,8 @@ jobs:
             privoxy \
             netcat-openbsd \
             xbindkeys \
+            xdotool \
+            wmctrl \
             tzdata \
             libsecret-1-0 \
             libsecret-tools \
@@ -540,6 +542,46 @@ jobs:
             var ch = new BroadcastChannel('remote-desktop-dual-screen');
             var TIMEOUT = 4000;
             var partner = { seen: 0, w: 0, h: 0, leftW: 0 };
+
+            // NEW: DRAG WINDOWS BETWEEN THE SCREENS.
+            // noVNC normally stops the mouse at the edge of its browser window. While a mouse button is
+            // held, Chrome/Edge keep reporting the mouse position even outside the window. In two-screen
+            // mode this position is passed on, so a dragged window follows the mouse onto the other screen.
+            // Only the mouse position is changed, nothing else is sent.
+            var raw = { x: 0, y: 0, held: false, releasing: false };
+            function trackMouse(e) {
+              raw.x = e.clientX; raw.y = e.clientY;
+              if (e.type === 'mousedown') { raw.held = true; }
+              if (e.type === 'mouseup') {
+                raw.releasing = true;
+                setTimeout(function () { raw.releasing = false; raw.held = (e.buttons || 0) !== 0; }, 0);
+              }
+            }
+            ['mousedown', 'mousemove', 'mouseup'].forEach(function (t) { window.addEventListener(t, trackMouse, true); });
+            window.addEventListener('blur', function () { raw.held = false; });
+            function patchMouse(rfb) {
+              if (!rfb || rfb.__dualMouse) { return true; }
+              if (typeof rfb._sendMouse !== 'function' || !rfb._canvas || !rfb._display) { return false; }
+              var orig = rfb._sendMouse;
+              rfb._sendMouse = function (x, y, mask) {
+                if ((raw.held || raw.releasing) && partner.seen && Date.now() - partner.seen < TIMEOUT) {
+                  var r = this._canvas.getBoundingClientRect();
+                  var lx = raw.x - r.left, ly = raw.y - r.top;
+                  if (lx < 0 || ly < 0 || lx >= r.width || ly >= r.height) {
+                    var loc = this._display._viewportLoc || { x: 0, y: 0 };
+                    var fw = this._fbWidth || 0, fh = this._fbHeight || 0;
+                    if (fw > 0 && fh > 0) {
+                      x = Math.max(-loc.x, Math.min(fw - 1 - loc.x, Math.round(lx)));
+                      y = Math.max(-loc.y, Math.min(fh - 1 - loc.y, Math.round(ly)));
+                    }
+                  }
+                }
+                return orig.call(this, x, y, mask);
+              };
+              rfb.__dualMouse = true;
+              return true;
+            }
+            var mouseWarned = false;
             var lastSent = 0, lastKey = '', mode = '';
             document.title = 'Remote Desktop - Screen ' + me + (me === '1' ? ' (left)' : ' (right)');
 
@@ -592,6 +634,10 @@ jobs:
 
             function tick() {
               var rfb = UI.rfb;
+              if (rfb && !patchMouse(rfb) && !mouseWarned) {
+                mouseWarned = true;
+                console.warn('Two screens: this noVNC version does not allow dragging between the windows. Use Win+Shift+Left/Right.');
+              }
               var own = ownSize();
               var alive = Date.now() - partner.seen < TIMEOUT;
 
@@ -697,6 +743,8 @@ jobs:
             <p>If the browser asks for <b>window management</b> or <b>pop-ups</b>: choose "Allow".</p>
             <p>Move each window to its monitor (if needed) and press <kbd>F11</kbd> in both.
                The desktop adapts to the size of both windows by itself.</p>
+            <p>Move apps between the screens: drag the window over the edge, or press <kbd>Win</kbd> + <kbd>Shift</kbd> + <kbd>Left</kbd> / <kbd>Right</kbd>.
+               For dragging, your two monitors must be arranged side by side in Windows (screen 1 left, screen 2 right).</p>
             <p>Back to one screen: simply close the window "Screen 2".</p>
             <p id="zoom" class="warn" hidden></p>
             <button type="button" id="start">Start two screens</button>
@@ -1856,6 +1904,70 @@ jobs:
           sudo chmod +x /usr/local/bin/run-dialog
 
           # ------------------------------------------------------------------
+          # NEW: move the active window to the other screen (like Windows: Win+Shift+Left / Right).
+          # Keeps the position inside the screen; maximized windows stay maximized on the new screen.
+          # With only one screen it does nothing.
+          # ------------------------------------------------------------------
+          sudo tee /usr/local/bin/move-to-screen > /dev/null << 'EOF'
+          #!/usr/bin/python3
+          """move-to-screen left|right - move the active window to the neighbouring screen."""
+          import re, subprocess, sys
+
+          def run(*cmd):
+              try:
+                  return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
+              except Exception:
+                  return ""
+
+          def monitors():
+              mons = []
+              for line in run("xrandr", "--listmonitors").splitlines()[1:]:
+                  m = re.search(r"(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)", line)
+                  if m:
+                      w, h, x, y = map(int, m.groups())
+                      mons.append((x, y, w, h))
+              return sorted(mons)
+
+          def main():
+              direction = sys.argv[1] if len(sys.argv) > 1 else "right"
+              mons = monitors()
+              if len(mons) < 2:
+                  return 0
+              win = run("xdotool", "getactivewindow").strip()
+              if not win.isdigit():
+                  return 0
+              geo = dict(re.findall(r"(\w+)=(-?\d+)", run("xdotool", "getwindowgeometry", "--shell", win)))
+              try:
+                  x, y, w, h = (int(geo[k]) for k in ("X", "Y", "WIDTH", "HEIGHT"))
+              except (KeyError, ValueError):
+                  return 0
+              cx, cy = x + w // 2, y + h // 2
+              cur = 0
+              for i, (mx, my, mw, mh) in enumerate(mons):
+                  if mx <= cx < mx + mw and my <= cy < my + mh:
+                      cur = i
+                      break
+              nxt = (cur + (1 if direction == "right" else -1)) % len(mons)
+              sx, sy, sw, sh = mons[cur]
+              tx, ty, tw, th = mons[nxt]
+              state = run("xprop", "-id", win, "_NET_WM_STATE")
+              maxed = "_NET_WM_STATE_MAXIMIZED_HORZ" in state or "_NET_WM_STATE_MAXIMIZED_VERT" in state
+              if maxed:
+                  run("wmctrl", "-i", "-r", win, "-b", "remove,maximized_vert,maximized_horz")
+              nx = tx + max(0, min(x - sx, tw - min(w, tw)))
+              ny = ty + max(0, min(y - sy, th - min(h, th)))
+              run("xdotool", "windowmove", win, str(nx), str(ny))
+              if maxed:
+                  run("wmctrl", "-i", "-r", win, "-b", "add,maximized_vert,maximized_horz")
+              return 0
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          EOF
+          sudo chmod +x /usr/local/bin/move-to-screen
+          python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" /usr/local/bin/move-to-screen && echo "✅ move-to-screen installed"
+
+          # ------------------------------------------------------------------
           # Runner clock (bottom right, directly above the bottom panel) - same size as before:
           #  - line 1 (small): time left until this runner shuts down + end time
           #  - line 2: world clock in ONE line, small, from west to east:
@@ -2004,8 +2116,10 @@ jobs:
                   return ""
 
 
-          def reserved_bottom(own_xid):
-              """Height that other docks (the GNOME bottom panel) reserve at the bottom of the screen."""
+          def reserved_bottom(own_xid, mon_x0, mon_x1, gap):
+              """Height that other docks (the GNOME bottom panel) reserve at the bottom of ONE monitor.
+              X measures struts from the bottom of the WHOLE desktop. With two screens of different
+              height the gap below the shorter screen is subtracted, otherwise the clock floats up."""
               best = 0
               for wid in re.findall(r"0x[0-9a-fA-F]+", xprop("-root", "_NET_CLIENT_LIST")):
                   if int(wid, 16) == own_xid:
@@ -2014,9 +2128,21 @@ jobs:
                   if "=" not in out:
                       continue
                   nums = [int(n) for n in re.findall(r"\d+", out.split("=", 1)[1])]
-                  if len(nums) >= 4:
-                      best = max(best, nums[3])
-              return best
+                  if len(nums) < 4 or nums[3] <= 0:
+                      continue
+                  if len(nums) >= 12 and (nums[11] < mon_x0 or nums[10] > mon_x1):
+                      continue   # this dock is on the other screen
+                  best = max(best, nums[3] - gap)
+              return max(0, best)
+
+
+          def left_monitor(display):
+              """Screen 1 = the monitor furthest to the left (also when the desktop has two screens)."""
+              mons = [display.get_monitor(i) for i in range(display.get_n_monitors())]
+              mons = [m for m in mons if m is not None]
+              if not mons:
+                  return None
+              return min(mons, key=lambda m: (m.get_geometry().x, m.get_geometry().y))
 
 
           def set_strut(xid, bottom, x0, x1):
@@ -2130,14 +2256,20 @@ jobs:
               def place(self, rescan=False):
                   win = self.get_window()
                   display = Gdk.Display.get_default()
-                  mon = display.get_primary_monitor() or display.get_monitor(0) if display else None
+                  mon = left_monitor(display) if display else None
                   if win is None or mon is None:
                       return True
                   g = mon.get_geometry()
                   xid = win.get_xid()
-                  if rescan or time.monotonic() - self.scanned > 10:
-                      self.panel = reserved_bottom(xid)
+                  # Height of the whole desktop (with two screens of different height it is taller than screen 1)
+                  root_h = max([g.y + g.height] + [display.get_monitor(i).get_geometry().y + display.get_monitor(i).get_geometry().height
+                                                   for i in range(display.get_n_monitors())])
+                  gap = max(0, root_h - (g.y + g.height))
+                  layout = (g.x, g.y, g.width, g.height, root_h)
+                  if rescan or layout != getattr(self, "layout", None) or time.monotonic() - self.scanned > 10:
+                      self.panel = reserved_bottom(xid, g.x, g.x + g.width - 1, gap)
                       self.scanned = time.monotonic()
+                      self.layout = layout
                   nat = self.get_preferred_size()[1]
                   w, h = nat.width, nat.height
                   # Very narrow screen: make the world clock part smaller instead of taking more space
@@ -2152,7 +2284,7 @@ jobs:
                       self.resize(w, h)
                       self.move(x, y)
                       self.geo = (x, y, w, h)
-                  strut = (self.panel + h, x, g.x + g.width - 1)
+                  strut = (gap + self.panel + h, x, g.x + g.width - 1)
                   if strut != self.strut:
                       set_strut(xid, *strut)
                       self.strut = strut
@@ -2325,6 +2457,10 @@ jobs:
 
           "xfce4-terminal --geometry=110x30 --hide-menubar --hide-toolbar"
             Control+Alt + t
+          "/usr/local/bin/move-to-screen left"
+            Shift+Mod4 + Left
+          "/usr/local/bin/move-to-screen right"
+            Shift+Mod4 + Right
           EOF
 
           # Terminal look (fallback for older xfce4-terminal versions; newer ones are set via xfconf in the session script)
@@ -2500,6 +2636,9 @@ jobs:
           kb $WMK switch-to-workspace-right "['<Control><Super>Right']"
           kb org.gnome.metacity.keybindings toggle-tiled-left "['<Super>Left']"
           kb org.gnome.metacity.keybindings toggle-tiled-right "['<Super>Right']"
+          # NEW: Win+Shift+Left/Right = move window to the other screen (done by xbindkeys + move-to-screen)
+          kb $WMK move-to-monitor-left "@as []"
+          kb $WMK move-to-monitor-right "@as []"
 
           for f in "$HOME"/Desktop/*.desktop; do gio set "$f" metadata::trusted true 2>/dev/null || true; done
 
@@ -2540,6 +2679,11 @@ jobs:
             start_if_missing gnome-panel gnome-panel
             # Windows-like app shortcuts (Win+E, Win+R, Win+I, Ctrl+Shift+Esc, Ctrl+Alt+T)
             command -v xbindkeys >/dev/null && start_if_missing xbindkeys xbindkeys -n -f "$HOME/.xbindkeysrc"
+            # NEW: with two screens the LEFT one (screen 1) is the main screen: panel + clock stay there
+            LEFT_OUT=$(xrandr --listmonitors 2>/dev/null | awk 'NR>1 && $3 ~ /\+0\+0$/ {print $NF; exit}')
+            if [ -n "$LEFT_OUT" ] && ! xrandr --listmonitors 2>/dev/null | grep -q "\*$LEFT_OUT "; then
+              xrandr --output "$LEFT_OUT" --primary 2>/dev/null || true
+            fi
             # German time + world clock + runner countdown (bottom right)
             if ! pgrep -u "$(id -u)" -f /usr/local/bin/runner-clock >/dev/null; then
               echo "$(date '+%H:%M:%S') starting runner-clock"
@@ -2669,7 +2813,7 @@ jobs:
           pgrep -a -x gnome-flashback || echo "⚠️ gnome-flashback is not running"
           pgrep -a -x gnome-panel || echo "⚠️ gnome-panel is not running"
           pgrep -a -x gsd-xsettings || echo "⚠️ gsd-xsettings is not running (fonts/scale may look different)"
-          pgrep -x xbindkeys >/dev/null && echo "xbindkeys is running (Win+E, Win+R, Win+I, Ctrl+Shift+Esc)" || echo "⚠️ xbindkeys is not running (see /tmp/desktop-xbindkeys.log)"
+          pgrep -x xbindkeys >/dev/null && echo "xbindkeys is running (Win+E, Win+R, Win+I, Ctrl+Shift+Esc, Win+Shift+Left/Right)" || echo "⚠️ xbindkeys is not running (see /tmp/desktop-xbindkeys.log)"
           pgrep -f /usr/local/bin/runner-clock >/dev/null && echo "runner-clock is running" || echo "⚠️ runner-clock is not running (see /tmp/desktop-runner-clock.log)"
           pgrep -x privoxy >/dev/null && echo "privoxy is running (system-wide WARP proxy)" || echo "⚠️ privoxy is not running - apps outside Chrome have no internet"
 
@@ -2800,4 +2944,3 @@ jobs:
           done
 
           echo "This run ends now - the next run has taken over or will do so shortly."​‌
-
