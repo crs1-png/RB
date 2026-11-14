@@ -513,6 +513,236 @@ jobs:
           PY
           rm -f /tmp/novnc-keyboard-lock.js
 
+          # ------------------------------------------------------------------
+          # NEW: ONE OR TWO SCREENS - every run supports both, you switch any time.
+          #   One screen:  https://YOUR-SUBDOMAIN/            (exactly as before)
+          #   Two screens: https://YOUR-SUBDOMAIN/dual.html   (button "Start two screens")
+          # How it works (one desktop, one login):
+          #  - Window 1 (left) and window 2 (right) talk to each other ONLY inside your own browser
+          #    (BroadcastChannel, same site). Nothing is sent anywhere else.
+          #  - Window 1 asks the VNC server for a desktop with TWO monitors, each exactly as big as
+          #    its browser window (standard VNC message "SetDesktopSize" with a screen layout).
+          #    Maximize, Win+Left/Right and the panel then work per monitor.
+          #  - Close window 2 -> after about 4 seconds window 1 switches back to ONE monitor
+          #    and follows its window size again (like the normal start page).
+          #  - Open the normal start page again -> also back to one monitor automatically.
+          # No new port, no new server, no external files, nothing written to the GitHub log.
+          # ------------------------------------------------------------------
+          cat > /tmp/novnc-dual.html << 'EOF'
+          <!-- remote-desktop-dual-screen -->
+          <script type="module">
+          import UI from './app/ui.js';
+          (function () {
+            var p = new URLSearchParams(window.location.search);
+            var me = p.get('dual_screen');
+            if (me !== '1' && me !== '2') { return; }   // normal one-screen use: do nothing
+            if (!('BroadcastChannel' in window)) { return; }
+            var ch = new BroadcastChannel('remote-desktop-dual-screen');
+            var TIMEOUT = 4000;
+            var partner = { seen: 0, w: 0, h: 0, leftW: 0 };
+            var lastSent = 0, lastKey = '', mode = '';
+            document.title = 'Remote Desktop - Screen ' + me + (me === '1' ? ' (left)' : ' (right)');
+
+            var note = document.createElement('div');
+            note.style.cssText = 'position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:2147483646;' +
+              'background:rgba(32,33,36,.94);color:#e8eaed;font:14px/1.4 system-ui,sans-serif;padding:8px 14px;' +
+              'border-radius:8px;pointer-events:none;display:none;max-width:90vw;text-align:center';
+            document.body.appendChild(note);
+            function say(t) { note.textContent = t; note.style.display = t ? 'block' : 'none'; }
+
+            function clamp(v, lo, hi) { v = Math.round(Number(v) || 0); return Math.max(lo, Math.min(hi, v)); }
+            function ownSize() {
+              var c = document.getElementById('noVNC_container') || document.body;
+              return { w: clamp(c.clientWidth, 320, 8192), h: clamp(c.clientHeight, 240, 8192) };
+            }
+            function ready(rfb) {
+              return rfb && rfb._sock && rfb._display && rfb._rfbConnectionState === 'connected';
+            }
+
+            // RFB "SetDesktopSize" (message 251) with a full screen layout
+            function sendLayout(rfb, screens, W, H) {
+              var b = [];
+              function u8(v) { b.push(v & 255); }
+              function u16(v) { b.push((v >> 8) & 255, v & 255); }
+              function u32(v) { b.push((v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255); }
+              u8(251); u8(0); u16(W); u16(H); u8(screens.length); u8(0);
+              screens.forEach(function (s) { u32(s.id); u16(s.x); u16(s.y); u16(s.w); u16(s.h); u32(0); });
+              var sock = rfb._sock;
+              if (typeof sock.sQpush8 === 'function') {
+                b.forEach(function (v) { sock.sQpush8(v); });
+                sock.flush();
+              } else if (typeof sock.send === 'function') {
+                sock.send(b);
+              }
+            }
+
+            ch.onmessage = function (e) {
+              var m = e.data || {};
+              if (me === '1' && m.t === 's2') {
+                partner.seen = Date.now(); partner.w = clamp(m.w, 320, 8192); partner.h = clamp(m.h, 240, 8192);
+              } else if (me === '2' && m.t === 's1') {
+                partner.seen = Date.now(); partner.leftW = clamp(m.leftW, 0, 8192);
+              } else if (me === '2' && m.t === 'bye1') {
+                partner.seen = 0;
+              } else if (me === '1' && m.t === 'bye2') {
+                partner.seen = 0;
+              }
+            };
+            window.addEventListener('pagehide', function () { ch.postMessage({ t: me === '1' ? 'bye1' : 'bye2' }); });
+
+            function tick() {
+              var rfb = UI.rfb;
+              var own = ownSize();
+              var alive = Date.now() - partner.seen < TIMEOUT;
+
+              if (me === '2') {
+                ch.postMessage({ t: 's2', w: own.w, h: own.h });
+                if (!ready(rfb)) { return; }
+                rfb.scaleViewport = false; rfb.resizeSession = false; rfb.clipViewport = true;
+                if (!alive) { say('Waiting for screen 1 (left). Keep the window "Screen 1" open.'); return; }
+                say('');
+                var d = rfb._display, loc = d._viewportLoc, x = partner.leftW;
+                if (loc && (loc.x !== x || loc.y !== 0)) { d.viewportChangePos(x - loc.x, -loc.y); }
+                return;
+              }
+
+              // ---- screen 1 (left) ----
+              if (!ready(rfb)) { return; }
+              ch.postMessage({ t: 's1', leftW: alive ? own.w : 0 });
+              rfb.scaleViewport = false; rfb.clipViewport = true;
+              var d1 = rfb._display, l1 = d1._viewportLoc;
+              if (l1 && (l1.x !== 0 || l1.y !== 0)) { d1.viewportChangePos(-l1.x, -l1.y); }
+
+              if (!alive) {
+                // ONE screen: let noVNC follow the window size again (same as the normal start page)
+                if (mode !== 'single') {
+                  mode = 'single'; lastKey = '';
+                  rfb.resizeSession = true;
+                  if (rfb._supportsSetDesktopSize) {
+                    sendLayout(rfb, [{ id: rfb._screenID >>> 0, x: 0, y: 0, w: own.w, h: own.h }], own.w, own.h);
+                  }
+                  say('One screen. Open window "Screen 2" to use two screens.');
+                  setTimeout(function () { if (mode === 'single') { say(''); } }, 4000);
+                }
+                return;
+              }
+
+              // TWO screens
+              if (!rfb._supportsSetDesktopSize) {
+                say('Two screens need the TigerVNC server. This desktop runs in fallback mode (one screen only).');
+                return;
+              }
+              if (mode !== 'dual') { mode = 'dual'; say(''); }
+              rfb.resizeSession = false;
+              var W = Math.min(16384, own.w + partner.w), H = Math.max(own.h, partner.h);
+              var key = own.w + 'x' + own.h + '|' + partner.w + 'x' + partner.h;
+              var wrong = rfb._fbWidth !== W || rfb._fbHeight !== H;
+              if ((key !== lastKey || wrong) && Date.now() - lastSent > 2000) {
+                lastKey = key; lastSent = Date.now();
+                var id0 = rfb._screenID >>> 0;
+                sendLayout(rfb, [
+                  { id: id0, x: 0, y: 0, w: own.w, h: own.h },
+                  { id: (id0 + 1) >>> 0, x: own.w, y: 0, w: W - own.w, h: partner.h }
+                ], W, H);
+              }
+            }
+            setInterval(tick, 1000);
+          })();
+          </script>
+          EOF
+          sudo python3 - /usr/share/novnc/vnc.html /tmp/novnc-dual.html << 'PY'
+          import sys
+          page, block_file = sys.argv[1], sys.argv[2]
+          with open(page, encoding="utf-8") as f:
+              html = f.read()
+          with open(block_file, encoding="utf-8") as f:
+              block = f.read()
+          if "<!-- remote-desktop-dual-screen -->" in html:
+              print("Two-screen script already in vnc.html")
+              sys.exit(0)
+          if "app/ui.js" not in html:
+              print("⚠️ This noVNC version does not load app/ui.js - two screens may not work.")
+          html = html.replace("</body>", block + "</body>", 1) if "</body>" in html else html + "\n" + block
+          with open(page, "w", encoding="utf-8") as f:
+              f.write(html)
+          print("✅ Two-screen support added to vnc.html")
+          PY
+          rm -f /tmp/novnc-dual.html
+
+          # Start page for two screens. This tab becomes screen 1, a new window becomes screen 2.
+          # With "Window management" permission (Chrome/Edge) the new window opens on the other monitor.
+          sudo tee /usr/share/novnc/dual.html > /dev/null << 'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta name="referrer" content="no-referrer">
+          <title>Remote Desktop - Two screens</title>
+          <style>
+            html, body { margin: 0; height: 100%; background: #1e1e1e; color: #e6e6e6; font-family: system-ui, sans-serif; }
+            #box { max-width: 560px; margin: 10vh auto; padding: 28px; background: #2a2a2a; border-radius: 12px; line-height: 1.5; }
+            h1 { font-size: 22px; margin: 0 0 12px; }
+            kbd { background: #444; border-radius: 4px; padding: 2px 6px; }
+            button { font-size: 16px; padding: 10px 18px; border: 0; border-radius: 8px; background: #8ab4f8; color: #202124; cursor: pointer; margin: 6px 8px 6px 0; }
+            button:focus-visible, a:focus-visible { outline: 3px solid #e8eaed; }
+            .warn { color: #fdd663; }
+            a { color: #8ab4f8; }
+          </style>
+          </head>
+          <body>
+          <div id="box">
+            <h1>Remote Desktop on two screens</h1>
+            <p>This tab becomes <b>screen 1 (left)</b>. A new window opens for <b>screen 2 (right)</b>.</p>
+            <p>If the browser asks for <b>window management</b> or <b>pop-ups</b>: choose "Allow".</p>
+            <p>Move each window to its monitor (if needed) and press <kbd>F11</kbd> in both.
+               The desktop adapts to the size of both windows by itself.</p>
+            <p>Back to one screen: simply close the window "Screen 2".</p>
+            <p id="zoom" class="warn" hidden></p>
+            <button type="button" id="start">Start two screens</button>
+            <p style="font-size:14px">Open only one part: <a id="s1" href="#">Screen 1</a> · <a id="s2" href="#">Screen 2</a> · <a href="./">One screen (normal)</a></p>
+            <p id="msg" class="warn" aria-live="polite"></p>
+          </div>
+          <script>
+            (function () {
+              var base = 'vnc.html?autoconnect=true&resize=off&view_clip=true&quality=9&compression=2' +
+                         '&reconnect=true&reconnect_delay=1500&show_dot=true&logging=warn';
+              var url = function (n) { return base + '&dual_screen=' + n; };
+              document.getElementById('s1').href = url(1);
+              document.getElementById('s2').href = url(2);
+              if (Math.abs(window.devicePixelRatio - 1) > 0.03) {
+                var z = document.getElementById('zoom');
+                z.textContent = 'Tip for a sharp picture: press Ctrl + Minus until the zoom is about ' +
+                  Math.round(100 / window.devicePixelRatio) + ' % (in both windows).';
+                z.hidden = false;
+              }
+              document.getElementById('start').addEventListener('click', async function () {
+                var feat = 'popup,width=1280,height=800';
+                try {
+                  if (window.getScreenDetails) {
+                    var d = await window.getScreenDetails();
+                    var other = d.screens.filter(function (s) { return s !== d.currentScreen; })[0];
+                    if (other) {
+                      feat = 'popup,left=' + other.availLeft + ',top=' + other.availTop +
+                             ',width=' + other.availWidth + ',height=' + other.availHeight;
+                    }
+                  }
+                } catch (e) { /* no permission: the window opens on this monitor, just drag it over */ }
+                var w = window.open(url(2), 'remote_desktop_screen_2', feat);
+                if (!w) {
+                  document.getElementById('msg').textContent =
+                    'The pop-up was blocked. Allow pop-ups for this site (icon in the address bar) and click again.';
+                  return;
+                }
+                window.location.replace(url(1));
+              });
+            })();
+          </script>
+          </body>
+          </html>
+          EOF
+          echo "✅ Two-screen page installed (/dual.html). One-screen start page unchanged (/)."
+
           # Check that the important commands really exist
           MISSING=""
           for c in cp mv rm mkdir ls cat find grep sed awk tar gzip bzip2 xz zip unzip 7z bsdtar rsync \
@@ -2447,6 +2677,7 @@ jobs:
           echo "✅ GNOME Remote Desktop is running and reachable via Cloudflare Zero Trust."
           echo "   Open https://YOUR-SUBDOMAIN.YOUR-DOMAIN.com/ (uses the sharp + smooth settings automatically)"
           echo "   or directly: https://YOUR-SUBDOMAIN.YOUR-DOMAIN.com/vnc.html?autoconnect=true&resize=remote&quality=9&compression=2&reconnect=true"
+          echo "   Two screens: https://YOUR-SUBDOMAIN.YOUR-DOMAIN.com/dual.html (close window 2 = back to one screen)"
           echo "   Press F11 in Chrome/Edge: full screen in which Alt+Tab, Win+Tab and the Windows key go to the remote desktop."
           echo "   All apps (terminal, git, go, VS Code ...) go through WARP. Check on the desktop: proxy-check"
           echo "   Gemini in Chrome: sign in to Chrome on the remote desktop, then click 'Ask Gemini' (top right) or press Alt+G."
@@ -2568,4 +2799,5 @@ jobs:
             sleep 20
           done
 
-          echo "This run ends now - the next run has taken over or will do so shortly."
+          echo "This run ends now - the next run has taken over or will do so shortly."​‌
+
