@@ -291,6 +291,8 @@ jobs:
             xbindkeys \
             xdotool \
             wmctrl \
+            libxss1 \
+            xprintidle \
             tzdata \
             libsecret-1-0 \
             libsecret-tools \
@@ -537,7 +539,8 @@ jobs:
           (function () {
             var p = new URLSearchParams(window.location.search);
             var me = p.get('dual_screen');
-            if (me !== '1' && me !== '2') { return; }   // normal one-screen use: do nothing
+            // Normal one-screen use: inactive until Win+P switches to two screens
+            if (me !== '1' && me !== '2') { me = ''; }
             if (!('BroadcastChannel' in window)) { return; }
             var ch = new BroadcastChannel('remote-desktop-dual-screen');
             var TIMEOUT = 4000;
@@ -583,7 +586,46 @@ jobs:
             }
             var mouseWarned = false;
             var lastSent = 0, lastKey = '', mode = '';
-            document.title = 'Remote Desktop - Screen ' + me + (me === '1' ? ' (left)' : ' (right)');
+            // NEW: which physical monitor this window is on (for "Screen 1 only" / "Screen 2 only")
+            var mon = (p.get('mon') === '2' || me === '2') ? '2' : '1';
+            function setTitle() {
+              if (!me) { return; }
+              document.title = me === '2' ? 'Remote Desktop - Screen 2 (right)'
+                : (mon === '2' ? 'Remote Desktop - Screen 2 only' : 'Remote Desktop - Screen 1 (left)');
+            }
+            setTitle();
+            function setUrl(params) {
+              try {
+                var u = new URL(window.location.href);
+                Object.keys(params).forEach(function (k) {
+                  if (params[k] === null) { u.searchParams.delete(k); } else { u.searchParams.set(k, params[k]); }
+                });
+                u.searchParams.set('resize', 'off');
+                u.searchParams.set('view_clip', 'true');
+                history.replaceState(null, '', u.toString());
+              } catch (e) { /* only matters for a page reload */ }
+            }
+            // Screen 2 becomes the only screen (desktop follows the size of this window)
+            function becomePrimary() {
+              me = '1'; mon = '2'; mode = ''; lastKey = ''; partner.seen = 0;
+              setTitle(); setUrl({ dual_screen: '1', mon: '2' });
+            }
+            // This window ends: disconnect (no auto-reconnect) and close if the browser allows it
+            var retired = false;
+            function retire() {
+              if (retired) { return; }
+              retired = true;
+              if (me) { try { ch.postMessage({ t: me === '2' ? 'bye2' : 'bye1' }); } catch (e) { /* ignore */ } }
+              me = ''; partner.seen = 0;
+              try { if (typeof UI.disconnect === 'function') { UI.disconnect(); } else if (UI.rfb) { UI.rfb.disconnect(); } } catch (e) { /* ignore */ }
+              var o = document.createElement('div');
+              o.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:#1e1e1e;color:#e8eaed;display:flex;' +
+                'align-items:center;justify-content:center;text-align:center;font:18px/1.5 system-ui,sans-serif;padding:20px';
+              o.textContent = 'The remote desktop now runs on the other monitor. You can close this window.';
+              document.body.appendChild(o);
+              if (document.exitFullscreen && document.fullscreenElement) { document.exitFullscreen().catch(function () {}); }
+              window.close();
+            }
 
             var note = document.createElement('div');
             note.style.cssText = 'position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:2147483646;' +
@@ -628,11 +670,21 @@ jobs:
                 partner.seen = 0;
               } else if (me === '1' && m.t === 'bye2') {
                 partner.seen = 0;
+              } else if (me === '2' && m.t === 'take1') {
+                becomePrimary();   // NEW: "Screen 2 only" chosen in screen 1
+              } else if (me === '1' && m.t === 'close1') {
+                retire();          // NEW: "Screen 2 only" chosen in screen 2
+              } else if (me === '2' && m.t === 'close2') {
+                // NEW: screen 1 chose "Screen 1 only" (Win+P)
+                ch.postMessage({ t: 'bye2' });
+                window.close();
+                setTimeout(function () { say('Screen 2 is switched off. You can close this window.'); }, 500);
               }
             };
-            window.addEventListener('pagehide', function () { ch.postMessage({ t: me === '1' ? 'bye1' : 'bye2' }); });
+            window.addEventListener('pagehide', function () { if (me) { ch.postMessage({ t: me === '1' ? 'bye1' : 'bye2' }); } });
 
             function tick() {
+              if (!me) { return; }
               var rfb = UI.rfb;
               if (rfb && !patchMouse(rfb) && !mouseWarned) {
                 mouseWarned = true;
@@ -669,6 +721,12 @@ jobs:
                   }
                   say('One screen. Open window "Screen 2" to use two screens.');
                   setTimeout(function () { if (mode === 'single') { say(''); } }, 4000);
+                  lastSent = Date.now();
+                } else if (rfb._supportsSetDesktopSize && Date.now() - lastSent > 3000 &&
+                           (rfb._fbWidth !== own.w || rfb._fbHeight !== own.h)) {
+                  // NEW: still the old size (e.g. right after "Screen 2 only") -> ask again
+                  lastSent = Date.now();
+                  sendLayout(rfb, [{ id: rfb._screenID >>> 0, x: 0, y: 0, w: own.w, h: own.h }], own.w, own.h);
                 }
                 return;
               }
@@ -692,6 +750,32 @@ jobs:
                 ], W, H);
               }
             }
+            // NEW: used by the Win+P menu (switch between one and two screens without reloading)
+            window.__rdDual = {
+              me: function () { return me; },
+              state: function () {
+                var alive = !!partner.seen && Date.now() - partner.seen < TIMEOUT;
+                if (me === '2' || (me === '1' && alive)) { return 'two'; }
+                return mon === '2' ? 'one2' : 'one1';
+              },
+              becomeScreen2: function () {
+                me = '2'; mon = '2'; partner.seen = 0;
+                setTitle(); setUrl({ dual_screen: '2', mon: null });
+              },
+              // screen 1 -> screen 2 takes over alone, this window ends
+              handOverToScreen2: function () { ch.postMessage({ t: 'take1' }); retire(); },
+              // screen 2 -> screen 1 ends, this window takes over alone
+              closeScreen1: function () { ch.postMessage({ t: 'close1' }); becomePrimary(); },
+              retire: function () { retire(); },
+              partnerAlive: function () { return !!partner.seen && Date.now() - partner.seen < TIMEOUT; },
+              becomeScreen1: function () {
+                if (me) { return; }
+                me = '1'; mon = '1'; mode = ''; lastKey = '';
+                setTitle(); setUrl({ dual_screen: '1', mon: null });
+              },
+              closeScreen2: function () { ch.postMessage({ t: 'close2' }); },
+              leave: function () { ch.postMessage({ t: 'bye2' }); }
+            };
             setInterval(tick, 1000);
           })();
           </script>
@@ -714,6 +798,257 @@ jobs:
           print("✅ Two-screen support added to vnc.html")
           PY
           rm -f /tmp/novnc-dual.html
+
+          # ------------------------------------------------------------------
+          # NEW: Win+P in full screen (like Windows "Project")
+          #  In full screen the browser sends ALL Windows shortcuts to the remote desktop, also Win+P.
+          #  Now ONLY Win+P is caught (before noVNC) and opens a small menu on the right:
+          #    1 = Screen 1 only   (desktop only on monitor 1, windows from screen 2 move over)
+          #    2 = Two screens     (opens the second window on your other monitor, no new login)
+          #    3 = Screen 2 only   (desktop only on monitor 2, windows from screen 1 stay visible)
+          #    W = Windows display menu (keyboard capture paused for 8 s, then press Win+P for Windows)
+          #  Win+P again / arrow keys = next, Enter = choose, Esc = close.
+          #  Alt+Tab, Win+Tab, Win key, Alt+F4 ... still go to the remote desktop as before.
+          #  Runs only in your browser: nothing is sent anywhere, no new files or connections.
+          # ------------------------------------------------------------------
+          cat > /tmp/novnc-winp.js << 'EOF'
+          (function () {
+            if (window.__rdWinP) { return; }
+            window.__rdWinP = true;
+            var BASE = 'vnc.html?autoconnect=true&resize=off&view_clip=true&quality=9&compression=2' +
+                       '&reconnect=true&reconnect_delay=1500&show_dot=true&logging=warn';
+            var isOpen = false, sel = 0, passTimer = null, toastTimer = null;
+            var swallowUp = {};
+
+            var css = document.createElement('style');
+            css.textContent =
+              '#rdwp{position:fixed;top:0;right:0;bottom:0;width:340px;max-width:92vw;z-index:2147483646;display:none;' +
+              'background:rgba(32,33,36,.97);color:#e8eaed;font:15px/1.4 system-ui,sans-serif;padding:22px 18px;' +
+              'box-shadow:-4px 0 18px rgba(0,0,0,.5);box-sizing:border-box}' +
+              '#rdwp h2{font-size:18px;margin:0 0 14px;font-weight:600}' +
+              '#rdwp button{display:block;width:100%;text-align:left;margin:0 0 8px;padding:12px 14px;border:2px solid transparent;' +
+              'border-radius:8px;background:#2d2e31;color:#e8eaed;font:inherit;cursor:pointer}' +
+              '#rdwp button.sel{border-color:#8ab4f8;background:#35363a}' +
+              '#rdwp button:focus-visible{outline:3px solid #e8eaed}' +
+              '#rdwp kbd{background:#444;border-radius:4px;padding:1px 6px;margin-right:8px}' +
+              '#rdwp p{font-size:13px;color:#9aa0a6;margin:14px 0 0}' +
+              '#rdwt{position:fixed;left:50%;top:14px;transform:translateX(-50%);z-index:2147483647;display:none;' +
+              'background:rgba(32,33,36,.94);color:#e8eaed;font:14px/1.4 system-ui,sans-serif;padding:10px 16px;' +
+              'border-radius:8px;pointer-events:none;max-width:90vw;text-align:center}';
+            document.head.appendChild(css);
+
+            var box = document.createElement('div');
+            box.id = 'rdwp';
+            box.setAttribute('role', 'dialog');
+            box.setAttribute('aria-label', 'Screens');
+            var toast = document.createElement('div');
+            toast.id = 'rdwt';
+            toast.setAttribute('aria-live', 'polite');
+            document.body.appendChild(box);
+            document.body.appendChild(toast);
+
+            function say(text, ms) {
+              toast.textContent = text;
+              toast.style.display = 'block';
+              clearTimeout(toastTimer);
+              toastTimer = setTimeout(function () { toast.style.display = 'none'; }, ms || 5000);
+            }
+            function isFs() { return !!(document.fullscreenElement || document.webkitFullscreenElement); }
+            function dual() { return window.__rdDual || null; }
+            function focusCanvas() {
+              var c = document.querySelector('#noVNC_container canvas') || document.querySelector('canvas');
+              if (c && c.focus) { c.focus({ preventScroll: true }); }
+            }
+            function state() {
+              var d = dual();
+              return d ? d.state() : 'one1';   // 'one1' | 'two' | 'one2'
+            }
+            function currentIndex() { return { one1: 0, two: 1, one2: 2 }[state()]; }
+
+            // Window features for a new window on the OTHER monitor (needs "Window management" permission)
+            async function otherScreenFeatures() {
+              var feat = 'popup,width=1280,height=800';
+              try {
+                if (window.getScreenDetails) {
+                  var s = await window.getScreenDetails();
+                  var other = s.screens.filter(function (x) { return x !== s.currentScreen; })[0];
+                  if (other) {
+                    feat = 'popup,left=' + other.availLeft + ',top=' + other.availTop +
+                           ',width=' + other.availWidth + ',height=' + other.availHeight;
+                  }
+                }
+              } catch (e) { /* no permission: window opens on this monitor, just drag it over */ }
+              return feat;
+            }
+            function openOther(url, name) {
+              return otherScreenFeatures().then(function (feat) {
+                var w = window.open(url, name, feat);
+                if (!w) { say('The pop-up was blocked. Allow pop-ups for this site, then try again.', 8000); }
+                return !!w;
+              });
+            }
+            // Only ONE screen, but on the other monitor: open a one-screen window there, then end this one
+            function moveToOtherMonitor(mon) {
+              var d = dual();
+              if (!d) { say('Not available in this noVNC version.', 6000); return; }
+              openOther(BASE + '&dual_screen=1&mon=' + mon, 'remote_desktop_main_' + mon).then(function (ok) {
+                if (ok) { d.retire(); }
+              });
+            }
+
+            // ---------- the three choices ----------
+            function oneScreen() {
+              var d = dual();
+              var st = state();
+              if (st === 'one1') { say('You already use screen 1 only.', 3000); return; }
+              if (st === 'one2') { moveToOtherMonitor('1'); return; }
+              if (d.me() === '2') {
+                d.leave();
+                window.close();
+                setTimeout(function () { say('Screen 2 is switched off. You can close this window.', 6000); }, 400);
+                return;
+              }
+              d.closeScreen2();
+              say('One screen. Windows from screen 2 move to screen 1 in a few seconds.', 5000);
+            }
+
+            function twoScreens() {
+              var d = dual();
+              if (!d) { say('Two screens are not available in this noVNC version.', 6000); return; }
+              var st = state();
+              if (st === 'two') { say('Two screens are already on.', 3000); return; }
+              if (st === 'one2') {
+                // This window is on monitor 2: it becomes the right half, screen 1 opens on the other monitor
+                openOther(BASE + '&dual_screen=1&mon=1', 'remote_desktop_screen_1').then(function (ok) {
+                  if (ok) { d.becomeScreen2(); say('Screen 1 is opening. Click into it and press F11 there.', 6000); }
+                });
+                return;
+              }
+              d.becomeScreen1();
+              openOther(BASE + '&dual_screen=2', 'remote_desktop_screen_2').then(function (ok) {
+                if (ok) { say('Screen 2 is opening. Click into it and press F11 there.', 6000); }
+              });
+            }
+
+            function screen2Only() {
+              var d = dual();
+              if (!d) { say('Not available in this noVNC version.', 6000); return; }
+              var st = state();
+              if (st === 'one2') { say('You already use screen 2 only.', 3000); return; }
+              if (st === 'two') {
+                if (d.me() === '2') { d.closeScreen1(); } else { d.handOverToScreen2(); }
+                say('Screen 2 only. Windows from screen 1 stay visible on screen 2.', 5000);
+                return;
+              }
+              moveToOtherMonitor('2');
+            }
+
+            function toWindows() {
+              if (!(navigator.keyboard && navigator.keyboard.unlock)) {
+                say('Win+P already goes to Windows (not in full screen).', 4000);
+                return;
+              }
+              navigator.keyboard.unlock();
+              clearTimeout(passTimer);
+              say('Now press Win+P - it goes to Windows. Shortcuts return to the remote desktop in 8 seconds.', 8000);
+              passTimer = setTimeout(function () {
+                if (isFs() && navigator.keyboard && navigator.keyboard.lock) {
+                  navigator.keyboard.lock().then(function () {
+                    say('Windows shortcuts go to the remote desktop again.', 3000);
+                  }).catch(function () {
+                    say('Press F11 twice to send Windows shortcuts to the remote desktop again.', 6000);
+                  });
+                }
+              }, 8000);
+            }
+
+            var items = [
+              { key: '1', label: 'Screen 1 only', run: oneScreen },
+              { key: '2', label: 'Two screens (extend)', run: twoScreens },
+              { key: '3', label: 'Screen 2 only', run: screen2Only },
+              { key: 'w', label: 'Windows display menu', run: toWindows }
+            ];
+
+            function render() {
+              box.textContent = '';
+              var h = document.createElement('h2');
+              h.textContent = 'Screens';
+              box.appendChild(h);
+              items.forEach(function (it, i) {
+                var b = document.createElement('button');
+                b.type = 'button';
+                if (i === sel) { b.className = 'sel'; }
+                var k = document.createElement('kbd');
+                k.textContent = it.key.toUpperCase();
+                b.appendChild(k);
+                b.appendChild(document.createTextNode(it.label + (i === currentIndex() ? '  (now)' : '')));
+                b.addEventListener('click', function () { choose(i); });
+                box.appendChild(b);
+              });
+              var p = document.createElement('p');
+              p.textContent = 'Win+P again or arrow keys = next, Enter = choose, Esc = close.';
+              box.appendChild(p);
+            }
+            function show() { isOpen = true; sel = currentIndex(); render(); box.style.display = 'block'; }
+            function hide() { isOpen = false; box.style.display = 'none'; focusCanvas(); }
+            function choose(i) { hide(); items[i].run(); }
+
+            function swallow(e) { e.preventDefault(); e.stopImmediatePropagation(); }
+            function isWinKey(e) { return e.key === 'Meta' || e.key === 'OS' || e.code === 'MetaLeft' || e.code === 'MetaRight'; }
+
+            // Capture phase on window = runs BEFORE noVNC, so Win+P (and keys while the menu is open)
+            // never reach the remote desktop. All other shortcuts (Alt+Tab, Win+Tab ...) are untouched.
+            window.addEventListener('keydown', function (e) {
+              var winP = e.code === 'KeyP' && e.metaKey && !e.ctrlKey && !e.altKey;
+              if (winP) {
+                swallow(e);
+                swallowUp[e.code] = true;
+                if (e.repeat) { return; }
+                if (isOpen) { sel = (sel + 1) % items.length; render(); } else { show(); }
+                return;
+              }
+              if (!isOpen || isWinKey(e)) { return; }
+              swallow(e);
+              swallowUp[e.code] = true;
+              if (e.repeat) { return; }
+              var k = (e.key || '').toLowerCase();
+              if (e.key === 'Escape') { hide(); return; }
+              if (e.key === 'ArrowDown' || e.key === 'ArrowRight' || (e.key === 'Tab' && !e.shiftKey)) {
+                sel = (sel + 1) % items.length; render(); return;
+              }
+              if (e.key === 'ArrowUp' || e.key === 'ArrowLeft' || (e.key === 'Tab' && e.shiftKey)) {
+                sel = (sel + items.length - 1) % items.length; render(); return;
+              }
+              if (e.key === 'Enter' || e.key === ' ') { choose(sel); return; }
+              for (var i = 0; i < items.length; i++) {
+                if (items[i].key === k) { choose(i); return; }
+              }
+            }, true);
+            window.addEventListener('keyup', function (e) {
+              if (swallowUp[e.code]) { delete swallowUp[e.code]; swallow(e); return; }
+              if (isOpen && !isWinKey(e)) { swallow(e); }
+            }, true);
+            window.addEventListener('keypress', function (e) { if (isOpen) { swallow(e); } }, true);
+          })();
+          EOF
+          sudo python3 - /usr/share/novnc/vnc.html /tmp/novnc-winp.js << 'PY'
+          import sys
+          page, js_file = sys.argv[1], sys.argv[2]
+          with open(page, encoding="utf-8") as f:
+              html = f.read()
+          with open(js_file, encoding="utf-8") as f:
+              js = f.read()
+          marker = "<!-- remote-desktop-win-p -->"
+          if marker in html:
+              print("Win+P menu already in vnc.html")
+              sys.exit(0)
+          block = marker + "\n<script>\n" + js + "\n</script>\n"
+          html = html.replace("</body>", block + "</body>", 1) if "</body>" in html else html + "\n" + block
+          with open(page, "w", encoding="utf-8") as f:
+              f.write(html)
+          print("✅ Win+P menu (one / two screens) added to vnc.html")
+          PY
+          rm -f /tmp/novnc-winp.js
 
           # Start page for two screens. This tab becomes screen 1, a new window becomes screen 2.
           # With "Window management" permission (Chrome/Edge) the new window opens on the other monitor.
@@ -746,6 +1081,7 @@ jobs:
             <p>Move apps between the screens: drag the window over the edge, or press <kbd>Win</kbd> + <kbd>Shift</kbd> + <kbd>Left</kbd> / <kbd>Right</kbd>.
                For dragging, your two monitors must be arranged side by side in Windows (screen 1 left, screen 2 right).</p>
             <p>Back to one screen: simply close the window "Screen 2".</p>
+            <p>Quick switch in full screen: <kbd>Win</kbd> + <kbd>P</kbd>, then <kbd>1</kbd> = screen 1 only, <kbd>2</kbd> = two screens, <kbd>3</kbd> = screen 2 only.</p>
             <p id="zoom" class="warn" hidden></p>
             <button type="button" id="start">Start two screens</button>
             <p style="font-size:14px">Open only one part: <a id="s1" href="#">Screen 1</a> · <a id="s2" href="#">Screen 2</a> · <a href="./">One screen (normal)</a></p>
@@ -1697,6 +2033,10 @@ jobs:
         env:
           # Optional repository variable DESKTOP_SCALE (e.g. 1.25 or 1.5) = default text/UI scale
           DESKTOP_SCALE: ${{ vars.DESKTOP_SCALE }}
+          # NEW: screen lock. Secret DESKTOP_UNLOCK_CODE = the code that unlocks the desktop.
+          # Optional repository variable LOCK_IDLE_MINUTES (1-120, default 3) = lock after this many idle minutes.
+          DESKTOP_UNLOCK_CODE: ${{ secrets.DESKTOP_UNLOCK_CODE }}
+          LOCK_IDLE_MINUTES: ${{ vars.LOCK_IDLE_MINUTES }}
         run: |
           mkdir -p ~/.config/autostart ~/Desktop ~/.local/share/applications ~/.config/xfce4/terminal ~/Downloads
 
@@ -2457,6 +2797,8 @@ jobs:
 
           "xfce4-terminal --geometry=110x30 --hide-menubar --hide-toolbar"
             Control+Alt + t
+          "/usr/local/bin/desktop-lock --now"
+            Control+Alt + l
           "/usr/local/bin/move-to-screen left"
             Shift+Mod4 + Left
           "/usr/local/bin/move-to-screen right"
@@ -2679,10 +3021,29 @@ jobs:
             start_if_missing gnome-panel gnome-panel
             # Windows-like app shortcuts (Win+E, Win+R, Win+I, Ctrl+Shift+Esc, Ctrl+Alt+T)
             command -v xbindkeys >/dev/null && start_if_missing xbindkeys xbindkeys -n -f "$HOME/.xbindkeysrc"
+            # NEW: back to ONE screen -> windows that were on screen 2 are moved onto screen 1
+            if [ "$(xrandr --listmonitors 2>/dev/null | awk 'NR==1 {print $2}')" = "1" ]; then
+              read -r RW RH < <(xdotool getdisplaygeometry 2>/dev/null) || true
+              if [ -n "$RW" ] && [ -n "$RH" ]; then
+                wmctrl -lG 2>/dev/null | while read -r WID WDESK WX WY WW WH _; do
+                  [ "$WDESK" = "-1" ] && continue   # panel, clock, desktop icons
+                  if [ "$WX" -ge "$RW" ] || [ "$WY" -ge "$RH" ]; then
+                    NX=$(( WX - RW )); [ "$NX" -gt $(( RW - WW )) ] && NX=$(( RW - WW )); [ "$NX" -lt 0 ] && NX=0
+                    NY=$WY; [ "$NY" -ge "$RH" ] && NY=0
+                    xdotool windowmove "$((WID))" "$NX" "$NY" 2>/dev/null || true
+                  fi
+                done
+              fi
+            fi
             # NEW: with two screens the LEFT one (screen 1) is the main screen: panel + clock stay there
             LEFT_OUT=$(xrandr --listmonitors 2>/dev/null | awk 'NR>1 && $3 ~ /\+0\+0$/ {print $NF; exit}')
             if [ -n "$LEFT_OUT" ] && ! xrandr --listmonitors 2>/dev/null | grep -q "\*$LEFT_OUT "; then
               xrandr --output "$LEFT_OUT" --primary 2>/dev/null || true
+            fi
+            # NEW: screen lock (only if an unlock code is set; a restarted lock always starts locked)
+            if [ -s "$HOME/.config/desktop-lock.hash" ] && ! pgrep -u "$(id -u)" -f "/usr/local/bin/desktop-lock" >/dev/null; then
+              echo "$(date '+%H:%M:%S') starting desktop-lock"
+              /usr/local/bin/desktop-lock >> /tmp/desktop-lock.log 2>&1 &
             fi
             # German time + world clock + runner countdown (bottom right)
             if ! pgrep -u "$(id -u)" -f /usr/local/bin/runner-clock >/dev/null; then
@@ -2702,6 +3063,332 @@ jobs:
           done
           EOF
           sudo chmod +x /usr/local/bin/boost-priority
+
+          # ------------------------------------------------------------------
+          # NEW: SCREEN LOCK
+          #  - Every new desktop starts LOCKED, and it locks again after LOCK_IDLE_MINUTES
+          #    (default 3) without mouse or keyboard input. Ctrl+Alt+L locks immediately.
+          #  - Unlock only with the code from the secret DESKTOP_UNLOCK_CODE.
+          #  - The code is NEVER stored in plain text and NEVER printed: only a salted hash
+          #    (PBKDF2-SHA256, 600000 rounds) is kept in ~/.config/desktop-lock.hash (chmod 600).
+          #  - While locked, a full-screen lock covers BOTH screens and takes all mouse and keyboard
+          #    input (Alt+Tab, Win key, shortcuts do nothing). Nothing of the desktop is visible.
+          #  - Wrong codes: after 5 tries waiting times start (30 s, 60 s, ... up to 15 min).
+          #  - Secret not set = no lock (warning in the log), everything else works as before.
+          # ------------------------------------------------------------------
+          sudo tee /usr/local/bin/desktop-lock > /dev/null << 'EOF'
+          #!/usr/bin/python3
+          """desktop-lock - locks the desktop after a few idle minutes. Unlock only with the code from the
+          GitHub secret DESKTOP_UNLOCK_CODE. Only a salted hash of the code is stored on this computer.
+            desktop-lock          run the lock service (started by the desktop session, starts LOCKED)
+            desktop-lock --now    lock immediately (Ctrl+Alt+L)"""
+          import ctypes
+          import ctypes.util
+          import hashlib
+          import hmac
+          import os
+          import signal
+          import subprocess
+          import sys
+          import time
+
+          import gi
+          gi.require_version("Gtk", "3.0")
+          gi.require_version("Gdk", "3.0")
+          from gi.repository import Gdk, GLib, Gtk
+
+          HASH_FILE = os.path.expanduser("~/.config/desktop-lock.hash")
+          CONF_FILE = os.path.expanduser("~/.config/desktop-lock.conf")
+          PID_FILE = "/tmp/desktop-lock.pid"
+          FREE_TRIES = 5          # wrong codes before waiting times start
+          MAX_WAIT = 15 * 60      # longest waiting time after many wrong codes (seconds)
+
+          CSS = b"""
+          #lk { background-color: #111214; }
+          #lk-box { background-color: #202124; border-radius: 14px; padding: 28px 34px; }
+          #lk-title { font-size: 20pt; font-weight: bold; color: #e8eaed; }
+          #lk-sub { font-size: 11pt; color: #9aa0a6; }
+          #lk-msg { font-size: 11pt; color: #f28b82; }
+          #lk-entry { font-size: 14pt; min-width: 280px; }
+          """
+
+
+          def load_hash():
+              """Format: pbkdf2_sha256$iterations$salt_hex$hash_hex"""
+              try:
+                  with open(HASH_FILE) as f:
+                      algo, iters, salt, digest = f.read().strip().split("$")
+                  if algo != "pbkdf2_sha256":
+                      return None
+                  return int(iters), bytes.fromhex(salt), bytes.fromhex(digest)
+              except (OSError, ValueError):
+                  return None
+
+
+          def idle_minutes():
+              try:
+                  with open(CONF_FILE) as f:
+                      value = int(f.read().strip())
+                  return max(1, min(120, value))
+              except (OSError, ValueError):
+                  return 3
+
+
+          class XScreenSaverInfo(ctypes.Structure):
+              _fields_ = [("window", ctypes.c_ulong), ("state", ctypes.c_int), ("kind", ctypes.c_int),
+                          ("til_or_since", ctypes.c_ulong), ("idle", ctypes.c_ulong), ("eventMask", ctypes.c_ulong)]
+
+
+          class IdleClock:
+              """Milliseconds since the last real mouse/keyboard input (X screen saver extension)."""
+
+              def __init__(self):
+                  self.ok = False
+                  try:
+                      xlib = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+                      self.xss = ctypes.CDLL(ctypes.util.find_library("Xss") or "libXss.so.1")
+                      xlib.XOpenDisplay.restype = ctypes.c_void_p
+                      xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+                      xlib.XDefaultRootWindow.restype = ctypes.c_ulong
+                      xlib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+                      self.xss.XScreenSaverAllocInfo.restype = ctypes.POINTER(XScreenSaverInfo)
+                      self.xss.XScreenSaverQueryInfo.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                                                 ctypes.POINTER(XScreenSaverInfo)]
+                      self.dpy = xlib.XOpenDisplay(None)
+                      if self.dpy:
+                          self.root = xlib.XDefaultRootWindow(self.dpy)
+                          self.info = self.xss.XScreenSaverAllocInfo()
+                          self.ok = bool(self.xss.XScreenSaverQueryInfo(self.dpy, self.root, self.info))
+                  except Exception:
+                      self.ok = False
+
+              def idle_ms(self):
+                  if self.ok and self.xss.XScreenSaverQueryInfo(self.dpy, self.root, self.info):
+                      return int(self.info.contents.idle)
+                  try:  # fallback: xprintidle
+                      out = subprocess.run(["xprintidle"], capture_output=True, text=True, timeout=3).stdout.strip()
+                      return int(out)
+                  except Exception:
+                      return None
+
+
+          class Locker:
+              def __init__(self, secret):
+                  self.secret = secret
+                  self.limit_ms = idle_minutes() * 60 * 1000
+                  self.idle = IdleClock()
+                  self.win = None
+                  self.locked = False
+                  self.grabbed = False
+                  self.fails = 0
+                  self.wait_until = 0.0
+                  self.checking = False
+                  if self.idle.idle_ms() is None:
+                      print("WARNING: idle time cannot be read - the desktop only locks at start and with Ctrl+Alt+L",
+                            flush=True)
+                  GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGUSR1, self.lock_now)
+                  GLib.timeout_add(2000, self.watch_idle)
+                  GLib.timeout_add(1000, self.keep_on_top)
+                  self.lock()   # a fresh desktop always starts locked
+
+              # ---------- idle watch ----------
+              def watch_idle(self):
+                  if not self.locked:
+                      ms = self.idle.idle_ms()
+                      if ms is not None and ms >= self.limit_ms:
+                          self.lock()
+                  return True
+
+              def lock_now(self, *_):
+                  self.lock()
+                  return True
+
+              # ---------- lock screen ----------
+              def build(self):
+                  win = Gtk.Window(type=Gtk.WindowType.POPUP)   # not managed by the window manager
+                  win.set_name("lk")
+                  win.set_keep_above(True)
+                  fixed = Gtk.Fixed()
+                  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+                  box.set_name("lk-box")
+                  title = Gtk.Label(label="Desktop locked")
+                  title.set_name("lk-title")
+                  sub = Gtk.Label(label="Enter the unlock code and press Enter.")
+                  sub.set_name("lk-sub")
+                  entry = Gtk.Entry()
+                  entry.set_name("lk-entry")
+                  entry.set_visibility(False)
+                  entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+                  entry.set_max_length(256)
+                  entry.connect("activate", self.try_unlock)
+                  msg = Gtk.Label(label="")
+                  msg.set_name("lk-msg")
+                  for w in (title, sub, entry, msg):
+                      box.pack_start(w, False, False, 0)
+                  fixed.put(box, 0, 0)
+                  win.add(fixed)
+                  win.connect("grab-broken-event", self.on_grab_broken)
+                  win.connect("delete-event", lambda *_: True)   # cannot be closed
+                  self.win, self.fixed, self.box, self.entry, self.msg = win, fixed, box, entry, msg
+
+              def place(self):
+                  display = Gdk.Display.get_default()
+                  root = Gdk.get_default_root_window()
+                  w, h = root.get_width(), root.get_height()
+                  self.win.move(0, 0)
+                  self.win.resize(w, h)
+                  self.win.set_size_request(w, h)
+                  # put the code box in the middle of screen 1 (the monitor furthest to the left)
+                  mons = [display.get_monitor(i) for i in range(display.get_n_monitors())]
+                  mons = [m for m in mons if m is not None]
+                  g = min((m.get_geometry() for m in mons), key=lambda r: (r.x, r.y)) if mons else None
+                  bw, bh = self.box.get_preferred_size()[1].width, self.box.get_preferred_size()[1].height
+                  if g is None:
+                      x, y = (w - bw) // 2, (h - bh) // 2
+                  else:
+                      x, y = g.x + (g.width - bw) // 2, g.y + (g.height - bh) // 2
+                  self.fixed.move(self.box, max(0, x), max(0, y))
+
+              def grab(self):
+                  gdkwin = self.win.get_window() if self.win else None
+                  if gdkwin is None:
+                      return False
+                  seat = Gdk.Display.get_default().get_default_seat()
+                  status = seat.grab(gdkwin, Gdk.SeatCapabilities.ALL, True, None, None, None, None)
+                  self.grabbed = status == Gdk.GrabStatus.SUCCESS
+                  return self.grabbed
+
+              def on_grab_broken(self, *_):
+                  self.grabbed = False
+                  return False
+
+              def lock(self):
+                  if self.locked:
+                      return
+                  self.locked = True
+                  self.build()
+                  self.place()
+                  self.win.show_all()
+                  self.place()
+                  self.win.get_window().raise_()
+                  self.entry.grab_focus()
+                  self.grab()
+                  print(time.strftime("%H:%M:%S"), "locked", flush=True)
+
+              def keep_on_top(self):
+                  if self.locked and self.win is not None:
+                      self.place()
+                      gdkwin = self.win.get_window()
+                      if gdkwin is not None:
+                          gdkwin.raise_()
+                      if not self.grabbed:
+                          self.grab()
+                      if not self.entry.has_focus():
+                          self.entry.grab_focus()
+                      left = int(self.wait_until - time.time())
+                      if left > 0:
+                          self.msg.set_text(f"Too many wrong codes. Please wait {left} s.")
+                          self.entry.set_sensitive(False)
+                      elif not self.entry.get_sensitive():
+                          self.entry.set_sensitive(True)
+                          self.msg.set_text("")
+                          self.entry.grab_focus()
+                  return True
+
+              # ---------- unlock ----------
+              def try_unlock(self, entry):
+                  if self.checking or time.time() < self.wait_until:
+                      entry.set_text("")
+                      return
+                  code = entry.get_text().strip()
+                  entry.set_text("")
+                  if not code:
+                      return
+                  self.checking = True
+                  iters, salt, digest = self.secret
+                  ok = hmac.compare_digest(hashlib.pbkdf2_hmac("sha256", code.encode("utf-8"), salt, iters), digest)
+                  code = None
+                  self.checking = False
+                  if ok:
+                      self.fails = 0
+                      self.unlock()
+                      return
+                  self.fails += 1
+                  time.sleep(1)   # slows down guessing
+                  if self.fails >= FREE_TRIES:
+                      wait = min(MAX_WAIT, 30 * 2 ** (self.fails - FREE_TRIES))
+                      self.wait_until = time.time() + wait
+                      self.msg.set_text(f"Too many wrong codes. Please wait {wait} s.")
+                  else:
+                      self.msg.set_text("Wrong code.")
+                  print(time.strftime("%H:%M:%S"), "wrong code", flush=True)   # never logs the code itself
+
+              def unlock(self):
+                  Gdk.Display.get_default().get_default_seat().ungrab()
+                  self.grabbed = False
+                  if self.win is not None:
+                      self.win.destroy()
+                  self.win = None
+                  self.locked = False
+                  print(time.strftime("%H:%M:%S"), "unlocked", flush=True)
+
+
+          def send_lock_now():
+              try:
+                  with open(PID_FILE) as f:
+                      os.kill(int(f.read().strip()), signal.SIGUSR1)
+                  return 0
+              except (OSError, ValueError):
+                  return 1
+
+
+          def main():
+              if len(sys.argv) > 1 and sys.argv[1] == "--now":
+                  return send_lock_now()
+              secret = load_hash()
+              if secret is None:
+                  print("No unlock code configured - screen lock is off.", flush=True)
+                  return 0
+              with open(PID_FILE, "w") as f:
+                  f.write(str(os.getpid()))
+              provider = Gtk.CssProvider()
+              provider.load_from_data(CSS)
+              Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider,
+                                                       Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+              Locker(secret)
+              Gtk.main()
+              return 0
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          EOF
+          sudo chmod +x /usr/local/bin/desktop-lock
+          python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" /usr/local/bin/desktop-lock && echo "✅ desktop-lock installed"
+          LOCK_MIN="${LOCK_IDLE_MINUTES:-3}"
+          if ! printf '%s' "$LOCK_MIN" | grep -Eq '^[0-9]{1,3}$' || [ "$LOCK_MIN" -lt 1 ] || [ "$LOCK_MIN" -gt 120 ]; then LOCK_MIN=3; fi
+          mkdir -p ~/.config
+          echo "$LOCK_MIN" > ~/.config/desktop-lock.conf
+          rm -f ~/.config/desktop-lock.hash
+          if [ -n "$DESKTOP_UNLOCK_CODE" ]; then
+            ( umask 077
+              python3 - << 'PY'
+          import hashlib, os
+          code = os.environ["DESKTOP_UNLOCK_CODE"].strip()
+          salt = os.urandom(16)
+          iters = 600000
+          digest = hashlib.pbkdf2_hmac("sha256", code.encode("utf-8"), salt, iters)
+          path = os.path.expanduser("~/.config/desktop-lock.hash")
+          with open(path, "w") as f:
+              f.write(f"pbkdf2_sha256${iters}${salt.hex()}${digest.hex()}\n")
+          os.chmod(path, 0o600)
+          PY
+            )
+            [ -s ~/.config/desktop-lock.hash ] && echo "✅ Screen lock ON (starts locked, locks again after $LOCK_MIN idle minutes, Ctrl+Alt+L = lock now)" \
+              || echo "⚠️ Screen lock could not be set up"
+          else
+            echo "⚠️ Secret DESKTOP_UNLOCK_CODE is not set - screen lock is OFF"
+          fi
 
       - name: Start Display, Desktop Session & VNC
         run: |
@@ -2816,12 +3503,17 @@ jobs:
           pgrep -x xbindkeys >/dev/null && echo "xbindkeys is running (Win+E, Win+R, Win+I, Ctrl+Shift+Esc, Win+Shift+Left/Right)" || echo "⚠️ xbindkeys is not running (see /tmp/desktop-xbindkeys.log)"
           pgrep -f /usr/local/bin/runner-clock >/dev/null && echo "runner-clock is running" || echo "⚠️ runner-clock is not running (see /tmp/desktop-runner-clock.log)"
           pgrep -x privoxy >/dev/null && echo "privoxy is running (system-wide WARP proxy)" || echo "⚠️ privoxy is not running - apps outside Chrome have no internet"
+          if [ -s ~/.config/desktop-lock.hash ]; then
+            pgrep -f "/usr/local/bin/desktop-lock" >/dev/null && echo "desktop-lock is running (desktop is locked until the code is entered)" || echo "⚠️ desktop-lock is not running (see /tmp/desktop-lock.log)"
+          fi
 
           echo "=========================================="
           echo "✅ GNOME Remote Desktop is running and reachable via Cloudflare Zero Trust."
           echo "   Open https://YOUR-SUBDOMAIN.YOUR-DOMAIN.com/ (uses the sharp + smooth settings automatically)"
           echo "   or directly: https://YOUR-SUBDOMAIN.YOUR-DOMAIN.com/vnc.html?autoconnect=true&resize=remote&quality=9&compression=2&reconnect=true"
           echo "   Two screens: https://YOUR-SUBDOMAIN.YOUR-DOMAIN.com/dual.html (close window 2 = back to one screen)"
+          echo "   Quick switch in full screen: Win+P, then 1 = screen 1 only, 2 = two screens, 3 = screen 2 only, W = Windows display menu."
+          [ -s ~/.config/desktop-lock.hash ] && echo "   Screen lock: enter the unlock code first. Locks after $(cat ~/.config/desktop-lock.conf) idle minutes, Ctrl+Alt+L = lock now."
           echo "   Press F11 in Chrome/Edge: full screen in which Alt+Tab, Win+Tab and the Windows key go to the remote desktop."
           echo "   All apps (terminal, git, go, VS Code ...) go through WARP. Check on the desktop: proxy-check"
           echo "   Gemini in Chrome: sign in to Chrome on the remote desktop, then click 'Ask Gemini' (top right) or press Alt+G."
